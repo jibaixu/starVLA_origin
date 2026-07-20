@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../../.." && pwd)}"
 LIBERO_HOME="${LIBERO_HOME:-}"
-LIBERO_python="${LIBERO_python:-python}"
-starVLA_python="${starVLA_python:-python}"
+LIBERO_PYTHON="${LIBERO_PYTHON:-${LIBERO_python:-python}}"
+STARVLA_PYTHON="${STARVLA_PYTHON:-${starVLA_python:-python}}"
 
 if [[ -z "${LIBERO_HOME}" ]]; then
   echo "LIBERO_HOME is required."
@@ -27,7 +27,7 @@ base_port=$4 # unique port for this eval instance
 num_trials_per_task=50
 host="127.0.0.1"
 
-CUDA_VISIBLE_DEVICES=$gpu_id ${starVLA_python} deployment/model_server/server_policy.py \
+CUDA_VISIBLE_DEVICES=$gpu_id ${STARVLA_PYTHON} deployment/model_server/server_policy.py \
     --ckpt_path ${your_ckpt} \
     --port ${base_port} \
     --use_bf16 &
@@ -35,6 +35,14 @@ CUDA_VISIBLE_DEVICES=$gpu_id ${starVLA_python} deployment/model_server/server_po
 
 # Get the server PID
 server_pid=$!
+
+cleanup() {
+    if kill -0 "$server_pid" 2>/dev/null; then
+        echo "Killing server process with PID: $server_pid"
+        kill "$server_pid"
+    fi
+}
+trap cleanup EXIT
 
 
 # Extract model_root from your_ckpt
@@ -48,7 +56,7 @@ mkdir -p "$log_path"
 
 
 
-${LIBERO_python} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
+${LIBERO_PYTHON} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \
@@ -59,9 +67,5 @@ ${LIBERO_python} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
 
 echo "Evaluation completed. Videos saved to ${video_out_path}, logs saved to ${log_path}/${folder_name}.log"
 
-if [ -n "$server_pid" ]; then
-    echo "Killing server process with PID: $server_pid"
-    kill $server_pid
-else
-    echo "No server process found to kill."
-fi
+cleanup
+trap - EXIT

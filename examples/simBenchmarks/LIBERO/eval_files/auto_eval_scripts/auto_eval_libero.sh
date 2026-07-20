@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../../.." && pwd)}"
 cd "${STARVLA_DIR}"
 SCRIPT_PATH="./examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall.sh"
 
@@ -10,12 +10,11 @@ SCRIPT_PATH="./examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_l
 ###############################################################################
 
 # --- Checkpoint directory (all .pt files inside will be evaluated) ---
-CKPT_DIR="results/Checkpoints/0415_libero4in1_WanOFT/checkpoints"
+CKPT_DIR="playground/Checkpoints/libero4in1_qwen3vl4b_gr00t_30k/checkpoints"
 
 # --- Or specify an explicit list (overrides CKPT_DIR when non-empty) ---
 CKPT_LIST=(
-    # "playground/Checkpoints/.../steps_30000_pytorch_model.pt"
-    # "playground/Checkpoints/.../steps_50000_pytorch_model.pt"
+    "playground/Checkpoints/libero4in1_qwen3vl4b_gr00t_30k/checkpoints/steps_30000_pytorch_model.pt"
 )
 
 # --- Task suites to evaluate ---
@@ -71,7 +70,7 @@ for ckpt in "${CKPT_LIST[@]}"; do
         ckpt_name=$(basename "$ckpt" .pt)
         echo "[Job ${job_index}] GPU=${gpu_id}  port=${port}  ckpt=${ckpt_name}  task=${task}"
 
-        bash "$SCRIPT_PATH" "$ckpt" "$task" "$gpu_id" "$port"
+        bash "$SCRIPT_PATH" "$ckpt" "$task" "$gpu_id" "$port" &
         pids+=($!)
 
         gpu_job_count[$gpu_idx]=$(( ${gpu_job_count[$gpu_idx]} + 1 ))
