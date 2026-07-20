@@ -10,6 +10,60 @@ Conventions:
 3. Put each training strategy in its own `trainer_*.py` file (avoid large if‑else chains).
 """
 
+def debug_on():
+    import os
+    import sys
+
+    explicit_debug = os.environ.get("STARVLA_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+    no_cli_args = len(sys.argv) == 1
+    enabled = explicit_debug or no_cli_args
+    if not enabled or not no_cli_args:
+        return
+
+    # Single-process defaults for direct IDE/Python debugging. If single-card
+    # DeepSpeed is not enough in your environment, launch with accelerate and
+    # keep STARVLA_DEBUG=1; existing rank variables from accelerate are kept.
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+    debug_env = {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+        "RANK": "0",
+        "LOCAL_RANK": "0",
+        "WORLD_SIZE": "1",
+        "WANDB_MODE": "disabled",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    for key, value in debug_env.items():
+        os.environ.setdefault(key, value)
+
+    sys.argv = [
+        "train_starvla.py",
+        "--config_yaml",
+        "./examples/simBenchmarks/LIBERO/train_files/starvla_cotrain_libero.yaml",
+        "--framework.name", "QwenGR00T",
+        "--framework.qwenvl.base_vlm", "playground/Pretrained_models/Qwen3-VL-4B-Instruct",
+        "--datasets.vla_data.data_root_dir", "playground/Datasets/LEROBOT_LIBERO_DATA",
+        "--datasets.vla_data.data_mix", "libero_all",
+        "--datasets.vla_data.per_device_batch_size", "1",
+        "--datasets.vla_data.video_backend", "torchvision_av",
+        "--datasets.vla_data.num_workers", "0",
+        "--trainer.freeze_modules", "",
+        "--trainer.max_train_steps", "1",
+        "--trainer.save_interval", "999999",
+        "--trainer.eval_interval", "999999",
+        "--trainer.logging_frequency", "1",
+        "--run_root_dir", "./playground/Checkpoints",
+        "--run_id", "debug_libero",
+        "--wandb_project", "starVLA_Libero",
+        "--wandb_entity", "jinhuiye",
+    ]
+    if "debugpy" not in sys.modules:
+        sys.argv.extend(["--is_debug", "True"])
+# debug_on()
+
 # Standard Library
 import argparse
 import json
