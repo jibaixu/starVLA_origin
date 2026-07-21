@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import json
 import logging
@@ -6,6 +7,7 @@ import os
 import pathlib
 import time
 
+import torch
 import imageio
 import numpy as np
 import tqdm
@@ -18,6 +20,20 @@ from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import Mode
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+
+@contextlib.contextmanager
+def _torch_load_weights_only_false_by_default():
+    original_load = torch.load
+
+    def patched_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = patched_load
+    try:
+        yield
+    finally:
+        torch.load = original_load
 
 
 def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
@@ -107,7 +123,8 @@ def eval_libero(args: Args) -> None:
         task = task_suite.get_task(task_id)
 
         # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+        with _torch_load_weights_only_false_by_default():
+            initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
