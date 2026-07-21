@@ -55,7 +55,12 @@ log_path="${model_root}/logs/${task_suite_name}"
 mkdir -p "$video_out_path"
 mkdir -p "$log_path"
 
-
+include_state_args=()
+case "${include_state,,}" in
+    true|1|yes|on)
+        include_state_args+=(--args.include-state)
+        ;;
+esac
 
 ${LIBERO_PYTHON} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
@@ -64,7 +69,7 @@ ${LIBERO_PYTHON} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
     --args.task-suite-name "$task_suite_name" \
     --args.num-trials-per-task "$num_trials_per_task" \
     --args.video-out-path "$video_out_path"  \
-    --args.include-state "$include_state" \
+    "${include_state_args[@]}" \
     2>&1 | tee ${log_path}/${folder_name}.log
 
 echo "Evaluation completed. Videos saved to ${video_out_path}, logs saved to ${log_path}/${folder_name}.log"
