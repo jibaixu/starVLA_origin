@@ -22,6 +22,7 @@ your_ckpt=$1 # results/Checkpoints/.../steps_20000_pytorch_model.pt
 task_suite_name=$2 # align with your model | libero_goal
 gpu_id=$3   # GPU id to use (e.g. 0, 1, 2, ...)
 base_port=$4 # unique port for this eval instance
+include_state=${5:-false} # true for checkpoints trained with datasets.vla_data.include_state=true
 ##### === variables for which evaluation to setup ===
 
 num_trials_per_task=50
@@ -63,6 +64,7 @@ ${LIBERO_PYTHON} ./examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
     --args.task-suite-name "$task_suite_name" \
     --args.num-trials-per-task "$num_trials_per_task" \
     --args.video-out-path "$video_out_path"  \
+    --args.include-state "$include_state" \
     2>&1 | tee ${log_path}/${folder_name}.log
 
 echo "Evaluation completed. Videos saved to ${video_out_path}, logs saved to ${log_path}/${folder_name}.log"

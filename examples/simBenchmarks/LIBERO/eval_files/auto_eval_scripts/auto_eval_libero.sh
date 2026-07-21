@@ -26,6 +26,10 @@ GPU_LIST=(0 1)
 # --- Base port (each job gets base_port + job_index) ---
 BASE_PORT=6450
 
+# --- Whether to send proprioceptive state to the policy server ---
+# Set true only for checkpoints trained with datasets.vla_data.include_state=true.
+INCLUDE_STATE=false
+
 # --- Seconds to wait between launching jobs on the SAME GPU ---
 SLEEP_BETWEEN=20
 
@@ -59,6 +63,7 @@ echo "=========================================="
 echo " Checkpoints : ${CKPT_LIST[*]}"
 echo " Task suites : ${TASK_SUITES[*]}"
 echo " GPU list    : ${GPU_LIST[*]}"
+echo " Include state: ${INCLUDE_STATE}"
 echo "=========================================="
 
 for ckpt in "${CKPT_LIST[@]}"; do
@@ -70,7 +75,7 @@ for ckpt in "${CKPT_LIST[@]}"; do
         ckpt_name=$(basename "$ckpt" .pt)
         echo "[Job ${job_index}] GPU=${gpu_id}  port=${port}  ckpt=${ckpt_name}  task=${task}"
 
-        bash "$SCRIPT_PATH" "$ckpt" "$task" "$gpu_id" "$port" &
+        bash "$SCRIPT_PATH" "$ckpt" "$task" "$gpu_id" "$port" "$INCLUDE_STATE" &
         pids+=($!)
 
         gpu_job_count[$gpu_idx]=$(( ${gpu_job_count[$gpu_idx]} + 1 ))

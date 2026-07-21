@@ -54,6 +54,8 @@ class Args:
     # Dataset key for un-normalization. None = auto (only if model trained on a single dataset).
     unnorm_key: str | None = None
 
+    include_state: bool = False
+
     post_process_action: bool = True
 
     job_name: str = "test"
@@ -168,6 +170,8 @@ def eval_libero(args: Args) -> None:
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
                 }
+                if args.include_state:
+                    example_dict["state"] = observation["observation.state"]
 
                 start_time = time.time()
 
