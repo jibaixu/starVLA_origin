@@ -296,6 +296,10 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
+                # Space2Act 会在 Qwen 词表末尾加入 S/F/P token。完整加载旧 base
+                # checkpoint 前，交由框架补齐词表形状并保留新增 token 的初始化行。
+                if hasattr(model, "adapt_checkpoint_state_dict"):
+                    checkpoint = model.adapt_checkpoint_state_dict(checkpoint)
                 model.load_state_dict(checkpoint, strict=False)
                 if _dist_rank() == 0:
                     print("✅ loaded <full_model> model parameters")

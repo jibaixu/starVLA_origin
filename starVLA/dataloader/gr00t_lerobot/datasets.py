@@ -51,6 +51,7 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+from starVLA.dataloader.gr00t_lerobot.teacher_latents import build_teacher_stores
 
 from functools import partial
 from typing import Tuple, List
@@ -633,6 +634,29 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_id = None
 
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+
+        # 调试或小规模实验可按 episode id 缩小每个 suite 的轨迹视图。
+        # 过滤必须发生在 teacher store 和 all_steps 构建之前，保证采样索引、
+        # teacher 文件集合及后续 step cache 始终对应同一批 episode。
+        episode_indices = self.data_cfg.get("episode_indices", None) if self.data_cfg is not None else None
+        if episode_indices is not None:
+            selected = {int(index) for index in episode_indices}
+            keep = np.array([int(index) in selected for index in self._trajectory_ids], dtype=bool)
+            missing = selected.difference(int(index) for index in self._trajectory_ids[keep])
+            if missing:
+                raise ValueError(
+                    f"Requested episode_indices are absent from {self.dataset_name}: {sorted(missing)}"
+                )
+            self._trajectory_ids = self._trajectory_ids[keep]
+            self._trajectory_lengths = self._trajectory_lengths[keep]
+            if not len(self._trajectory_ids):
+                raise ValueError(f"episode_indices selected no trajectories in {self.dataset_name}")
+
+        # 每个启用的 S/F/P 通道分别建立一个轻量索引。初始化阶段只缓存
+        # episode 文件路径和 anchor，不把体积较大的 teacher feature 常驻内存。
+        self._teacher_stores = build_teacher_stores(
+            self.dataset_path, self.data_cfg, self._trajectory_ids
+        )
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
@@ -981,7 +1005,9 @@ class LeRobotSingleDataset(Dataset):
             return (not dist.is_initialized()) or dist.get_rank() == 0
     
         config_key = self._get_steps_config_key()
-        steps_filename = "steps_data_index.pkl"
+        # episode 子集会改变可采样 step。将 config_key 放入文件名，避免全量数据和
+        # 调试子集复用同一个 steps cache，进而采到已被过滤的 episode。
+        steps_filename = f"steps_data_index_{config_key}.pkl"
         steps_path = self.dataset_path / "meta" / steps_filename
     
         # ---------- try to read from cache  ----------
@@ -989,6 +1015,10 @@ class LeRobotSingleDataset(Dataset):
             try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
+                # 文件名提供第一层隔离，这里再校验缓存内容，防止旧文件或人工改名
+                # 后悄悄返回与当前 dataset view 不一致的 step 列表。
+                if cached_data.get("config_key") != config_key:
+                    raise ValueError("cache configuration does not match this dataset view")
                 return cached_data["steps"]
             except Exception as e:
                 # include EOFError / PickleError / KeyError
@@ -1034,6 +1064,8 @@ class LeRobotSingleDataset(Dataset):
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            # trajectory_ids 必须参与 hash，否则不同 episode_indices 会得到相同 key。
+            "trajectory_ids": tuple(int(index) for index in self.trajectory_ids),
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -1374,10 +1406,10 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id=trajectory_id, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+    def _pack_sample(self, data: dict, trajectory_id: int | None = None, base_index: int | None = None) -> dict:
+        """将变换后的模态数据打包，并按需附加当前 step 的教师特征。"""
         step_images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
@@ -1396,6 +1428,18 @@ class LeRobotSingleDataset(Dataset):
             "lang": language,
             "robot_tag": self.tag
         }
+
+        # 教师特征只在对应通道启用时读取。trajectory_id 定位 episode 文件，
+        # base_index 定位当前帧；store 内部再将当前帧映射到最近的历史 anchor。
+        if self._teacher_stores:
+            if trajectory_id is None or base_index is None:
+                raise ValueError("Teacher latents require trajectory_id and base_index when packing a sample")
+            sample["space2act_teacher"] = {
+                name: store.get(int(trajectory_id), int(base_index))
+                for name, store in self._teacher_stores.items()
+            }
+            sample["episode_index"] = int(trajectory_id)
+            sample["frame_index"] = int(base_index)
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []
@@ -2383,7 +2427,9 @@ class LeRobotMixtureDataset(Dataset):
                     
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                # mixture 路径同样必须传入原始 episode/frame id，不能只传变换后的数据，
+                # 否则 teacher store 无法确定应该读取哪个 anchor。
+                sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=step)
                 
                 return sample
                 

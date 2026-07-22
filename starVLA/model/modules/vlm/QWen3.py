@@ -78,6 +78,83 @@ class _QWen3_VL_Interface(nn.Module):
             self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
             self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX
 
+        # token_ids 保存 S/F/P 三个类型化 token bank 的词表 id；active_channels
+        # 只控制本轮实验实际插入哪些 bank，二者分离便于阶段扩展和 checkpoint 兼容。
+        self.space2act_token_ids: dict[str, list[int]] = {}
+        self.space2act_active_channels: set[str] = set()
+
+    def configure_space2act_tokens(self, channel_configs, init_strategy: str = "avg") -> None:
+        """注册 S/F/P token bank，扩展 Qwen 词表，并记录当前阶段启用的通道。"""
+        # 即使 Stage 1 只启用 spatial，也一次性注册三类 token。这样后续 Stage 2/3
+        # 切换通道时词表大小和 token id 保持稳定，已有 checkpoint 可以直接续训。
+        channel_prefixes = {"spatial": "s", "future": "f", "plan": "p"}
+        all_tokens: list[str] = []
+        tokens_by_channel: dict[str, list[str]] = {}
+        for channel, prefix in channel_prefixes.items():
+            channel_cfg = channel_configs.get(channel, {})
+            token_count = int(channel_cfg.get("token_count", 32))
+            tokens = [f"<|space2act_{prefix}_{index:03d}|>" for index in range(token_count)]
+            tokens_by_channel[channel] = tokens
+            all_tokens.extend(tokens)
+
+        # tokenizer 与模型 embedding 必须同步扩容。只把词表中真正不存在的 token
+        # 记为 new token，避免恢复 Space2Act checkpoint 时重复初始化已有向量。
+        tokenizer = self.processor.tokenizer
+        previous_vocab = tokenizer.get_vocab()
+        tokens_to_initialize = [token for token in all_tokens if token not in previous_vocab]
+        old_size = self.model.get_input_embeddings().weight.shape[0]
+        tokenizer.add_special_tokens({"additional_special_tokens": all_tokens})
+        target_size = max(len(tokenizer), old_size)
+        if target_size > old_size:
+            self.model.resize_token_embeddings(target_size)
+
+        new_token_ids = [int(tokenizer.convert_tokens_to_ids(token)) for token in tokens_to_initialize]
+        if new_token_ids:
+            input_embedding = self.model.get_input_embeddings().weight
+            output_module = self.model.get_output_embeddings()
+            output_embedding = output_module.weight if output_module is not None else None
+            reference_size = min(len(previous_vocab), old_size)
+            with torch.no_grad():
+                # avg 是默认的平稳初始化；zero 和 normal 用于消融实验。若输入/输出
+                # embedding 未共享权重，两侧必须使用相同策略分别初始化。
+                if init_strategy == "avg":
+                    input_value = input_embedding[:reference_size].detach().float().mean(dim=0)
+                    input_embedding[new_token_ids] = input_value.to(input_embedding.dtype)
+                    if output_embedding is not None and output_embedding.data_ptr() != input_embedding.data_ptr():
+                        output_value = output_embedding[:reference_size].detach().float().mean(dim=0)
+                        output_embedding[new_token_ids] = output_value.to(output_embedding.dtype)
+                elif init_strategy == "zero":
+                    input_embedding[new_token_ids] = 0
+                    if output_embedding is not None and output_embedding.data_ptr() != input_embedding.data_ptr():
+                        output_embedding[new_token_ids] = 0
+                elif init_strategy == "normal":
+                    input_embedding[new_token_ids] = torch.randn(
+                        len(new_token_ids), input_embedding.shape[1],
+                        device=input_embedding.device, dtype=input_embedding.dtype,
+                    ) * 0.02
+                    if output_embedding is not None and output_embedding.data_ptr() != input_embedding.data_ptr():
+                        output_embedding[new_token_ids] = torch.randn(
+                            len(new_token_ids), output_embedding.shape[1],
+                            device=output_embedding.device, dtype=output_embedding.dtype,
+                        ) * 0.02
+                else:
+                    raise ValueError(f"Unsupported Space2Act token_init_strategy: {init_strategy}")
+
+        # 同时保存数值 id（用于从 hidden state 精确取位）和拼接文本（用于构造 prompt）。
+        self.space2act_token_ids = {
+            channel: [int(tokenizer.convert_tokens_to_ids(token)) for token in tokens]
+            for channel, tokens in tokens_by_channel.items()
+        }
+        self._space2act_token_text = {
+            channel: "".join(tokens) for channel, tokens in tokens_by_channel.items()
+        }
+        # token_enabled 只决定 forward 中是否插入，不影响已经注册的完整词表。
+        self.space2act_active_channels = {
+            channel
+            for channel in channel_prefixes
+            if channel_configs.get(channel, {}).get("token_enabled", False) in (True, "True", "true", 1)
+        }
+
     def forward(
         self,
         **kwargs,
@@ -129,7 +206,15 @@ class _QWen3_VL_Interface(nn.Module):
             else:
                 prompt = instruction
 
+            # 使用 Qwen 原生 causal mask，不额外构造 block mask。物理顺序固定为
+            # image -> S -> instruction -> F -> P，使 S 读取视觉信息，F/P 再读取指令
+            # 和前序 reasoning token；未启用的 bank 不进入当前样本。
+            if "spatial" in self.space2act_active_channels:
+                content.append({"type": "text", "text": self._space2act_token_text["spatial"]})
             content.append({"type": "text", "text": prompt})
+            for channel in ("future", "plan"):
+                if channel in self.space2act_active_channels:
+                    content.append({"type": "text", "text": self._space2act_token_text[channel]})
             msg = [{"role": "user", "content": content}]
 
             if solutions is not None:

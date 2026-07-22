@@ -20,9 +20,10 @@ def debug_on():
     if not enabled or not no_cli_args:
         return
 
-    # Single-process defaults for direct IDE/Python debugging. If single-card
-    # DeepSpeed is not enough in your environment, launch with accelerate and
-    # keep STARVLA_DEBUG=1; existing rank variables from accelerate are kept.
+    # 直接通过 IDE/Python 启动且没有命令行参数时，默认执行第一阶段单步调试：
+    # 仅启用 spatial 教师，并把数据限制到每个子数据集的前 3 个 episode。
+    # 若单卡 DeepSpeed 无法满足环境要求，可由 accelerate 启动并设置
+    # STARVLA_DEBUG=1；此时保留 accelerate 已写入的分布式环境变量。
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -42,21 +43,30 @@ def debug_on():
     sys.argv = [
         "train_starvla.py",
         "--config_yaml",
-        "./examples/simBenchmarks/LIBERO/train_files/starvla_cotrain_libero.yaml",
-        "--framework.name", "QwenGR00T",
-        "--framework.qwenvl.base_vlm", "playground/Pretrained_models/Qwen3-VL-4B-Instruct",
-        "--datasets.vla_data.data_root_dir", "playground/Datasets/LEROBOT_LIBERO_DATA",
+        "./examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml",
+        "--framework.name", "QwenSpace2ActGR00T",
+        "--framework.qwenvl.base_vlm", "./playground/Pretrained_models/Qwen3-VL-4B-Instruct",
+        "--framework.latent_reasoning.channels.spatial.token_enabled", "true",
+        "--framework.latent_reasoning.channels.spatial.alignment_enabled", "true",
+        "--framework.latent_reasoning.channels.future.token_enabled", "false",
+        "--framework.latent_reasoning.channels.future.alignment_enabled", "false",
+        "--framework.latent_reasoning.channels.plan.token_enabled", "false",
+        "--framework.latent_reasoning.channels.plan.alignment_enabled", "false",
+        "--datasets.vla_data.data_root_dir", "/data/jibaixu/Datasets/LIBERO/libero_no_noop",
         "--datasets.vla_data.data_mix", "libero_all",
+        "--datasets.vla_data.episode_indices", "[0,1,2]",
+        "--datasets.vla_data.teacher_latents.channels.spatial.relative_dir", "lingbot_latent_step4_numlayer24_stride16",
         "--datasets.vla_data.per_device_batch_size", "1",
         "--datasets.vla_data.video_backend", "torchvision_av",
         "--datasets.vla_data.num_workers", "0",
         "--trainer.freeze_modules", "",
+        "--trainer.gradient_accumulation_steps", "1",
         "--trainer.max_train_steps", "1",
         "--trainer.save_interval", "999999",
         "--trainer.eval_interval", "999999",
         "--trainer.logging_frequency", "1",
         "--run_root_dir", "./playground/Checkpoints",
-        "--run_id", "debug_libero",
+        "--run_id", "debug_space2act_libero_stage1_ep0_2",
         "--wandb_project", "starVLA_Libero",
         "--wandb_entity", "jinhuiye",
     ]
@@ -461,7 +471,9 @@ class VLATrainer(TrainerUtils):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                # Space2Act 的 total_loss = 动作损失 + 各教师对齐损失；基础框架
+                # 没有该字段时回退到 action_loss，使训练循环保持向后兼容。
+                total_loss = output_dict.get("total_loss", action_loss)
 
             self.accelerator.backward(total_loss)
 
@@ -477,9 +489,15 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {"action_dit_loss": action_loss.item(), "total_loss": total_loss.item()}
+        # 自动收集框架返回的标量（如各通道 alignment loss），避免训练器
+        # 为后续 future/plan 通道逐项增加硬编码日志字段。
+        for name, value in output_dict.items():
+            if name in {"action_loss", "total_loss"}:
+                continue
+            if torch.is_tensor(value) and value.numel() == 1:
+                metrics[name] = value.detach().item()
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
