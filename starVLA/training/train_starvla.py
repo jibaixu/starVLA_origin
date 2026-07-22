@@ -528,6 +528,12 @@ class VLATrainer(TrainerUtils):
 def main(cfg) -> None:
     logger.info("VLA Training :: Warming Up")
 
+    # 在模型构造前设置一次 seed，确保新增 token/alignment head 的初始化可复现；
+    # prepare_training 中会再次重置，从而让训练期 RNG 不受初始化耗用量影响。
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    seed = cfg.seed + rank if hasattr(cfg, "seed") else rank + 3047
+    set_seed(seed)
+
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
 

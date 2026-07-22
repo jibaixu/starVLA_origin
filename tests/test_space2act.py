@@ -1,9 +1,11 @@
-"""Space2Act 教师加载、对齐映射与 checkpoint 兼容性的核心单元测试。"""
+"""Space2Act 教师、对齐映射、checkpoint 与采样 seed 的核心单元测试。"""
 
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -13,6 +15,7 @@ from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
 )
 from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
 from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import QwenSpace2Act_GR00T
+from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 
 
 def _write_teacher(root: Path, features: torch.Tensor, anchors: torch.Tensor) -> None:
@@ -100,6 +103,43 @@ class Space2ActTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(adapted[key][0], checkpoint[key][0]))
         self.assertTrue(torch.equal(adapted[key][3], current_weight[3]))
+
+    @staticmethod
+    def _sampling_dataset(seed: int) -> LeRobotMixtureDataset:
+        """绕过磁盘数据构造，只保留 sample_step 所需的最小采样状态。"""
+        dataset = LeRobotMixtureDataset.__new__(LeRobotMixtureDataset)
+        trajectory_count = 32
+        dataset.datasets = [
+            SimpleNamespace(
+                trajectory_ids=np.arange(trajectory_count),
+                trajectory_lengths=np.full(trajectory_count, 64),
+            )
+        ]
+        dataset._dataset_sampling_weights = np.array([1.0])
+        dataset._trajectory_sampling_weights = [
+            np.full(trajectory_count, 1.0 / trajectory_count)
+        ]
+        dataset.seed = seed
+        dataset.mode = "train"
+        dataset.set_epoch(0)
+        return dataset
+
+    @staticmethod
+    def _sample_sequence(dataset: LeRobotMixtureDataset, count: int = 32):
+        return [
+            tuple(int(value) for value in dataset.sample_step(index)[1:])
+            for index in range(count)
+        ]
+
+    def test_sampling_seed_is_reproducible_but_configurable(self):
+        """同 seed 必须复现，而修改 seed 应切换固定的 episode/frame 序列。"""
+        first = self._sampling_dataset(seed=42)
+        replay = self._sampling_dataset(seed=42)
+        different_seed = self._sampling_dataset(seed=43)
+
+        sequence = self._sample_sequence(first)
+        self.assertEqual(sequence, self._sample_sequence(replay))
+        self.assertNotEqual(sequence, self._sample_sequence(different_seed))
 
 
 if __name__ == "__main__":

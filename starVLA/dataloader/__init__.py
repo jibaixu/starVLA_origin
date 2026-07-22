@@ -43,6 +43,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             data_cfg=vla_dataset_cfg,
             balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
+            # 数据采样 seed 独立写入配置，保证每个手动阶段既可复现也可主动换序。
+            seed=int(vla_dataset_cfg.get("seed", getattr(cfg, "seed", 42))),
         )
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {
