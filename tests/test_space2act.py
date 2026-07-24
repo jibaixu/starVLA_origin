@@ -1,12 +1,14 @@
 """Space2Act 教师、对齐映射、checkpoint 与采样 seed 的核心单元测试。"""
 
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from safetensors.torch import save_file
 
 from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
@@ -18,11 +20,20 @@ from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import QwenSpace2Act_GR00T
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 
 
-def _write_teacher(root: Path, features: torch.Tensor, anchors: torch.Tensor) -> None:
+def _write_teacher(
+    root: Path,
+    features: torch.Tensor,
+    anchors: torch.Tensor,
+    metadata: dict[str, str] | None = None,
+) -> None:
     """按真实目录和字段约定生成一个最小 safetensors 教师文件。"""
     path = root / "latents" / "chunk-000" / "episode_000000.safetensors"
     path.parent.mkdir(parents=True)
-    save_file({"features": features, "anchor_frames": anchors}, path)
+    save_file(
+        {"features": features, "anchor_frames": anchors},
+        path,
+        metadata=metadata,
+    )
 
 
 class Space2ActTest(unittest.TestCase):
@@ -52,6 +63,97 @@ class Space2ActTest(unittest.TestCase):
                 EpisodeTeacherStore(
                     root, TeacherChannelSpec("spatial", "latents", 2, 4), [0]
                 )
+
+    @staticmethod
+    def _future_spec() -> TeacherChannelSpec:
+        return TeacherChannelSpec(
+            "future",
+            "latents",
+            2,
+            4,
+            feature_dtype="bfloat16",
+            anchor_dtype="int64",
+            anchor_stride=8,
+            validate_episode_length=True,
+            expected_metadata={"complete": "true", "share_stride": "8"},
+        )
+
+    @staticmethod
+    def _future_metadata(**overrides) -> dict[str, str]:
+        metadata = {
+            "complete": "true",
+            "share_stride": "8",
+            "suite": "libero_goal",
+            "episode_index": "0",
+            "episode_length": "17",
+        }
+        metadata.update({key: str(value) for key, value in overrides.items()})
+        return metadata
+
+    def test_future_teacher_contract_and_stride_mapping(self):
+        """Stage 2 teacher 应校验 BF16/stride/episode，并按 latest anchor 共享。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "libero_goal_no_noops_1.0.0_lerobot"
+            features = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4).to(
+                torch.bfloat16
+            )
+            _write_teacher(
+                root,
+                features,
+                torch.tensor([0, 8, 16], dtype=torch.int64),
+                self._future_metadata(),
+            )
+            store = EpisodeTeacherStore(
+                root,
+                self._future_spec(),
+                [0],
+                episode_lengths={0: 17},
+            )
+
+            self.assertTrue(torch.equal(store.get(0, 0), features[0]))
+            self.assertTrue(torch.equal(store.get(0, 7), features[0]))
+            self.assertTrue(torch.equal(store.get(0, 8), features[1]))
+            self.assertTrue(torch.equal(store.get(0, 16), features[2]))
+
+    def test_future_teacher_rejects_dtype_anchor_and_metadata_mismatch(self):
+        """错误精度、anchor 起点/stride 或 episode metadata 必须在训练前失败。"""
+        cases = (
+            (
+                "feature dtype mismatch",
+                torch.zeros(3, 2, 4, dtype=torch.float32),
+                torch.tensor([0, 8, 16], dtype=torch.int64),
+                self._future_metadata(),
+            ),
+            (
+                "start at frame 0",
+                torch.zeros(3, 2, 4, dtype=torch.bfloat16),
+                torch.tensor([1, 9, 16], dtype=torch.int64),
+                self._future_metadata(),
+            ),
+            (
+                "stride mismatch",
+                torch.zeros(3, 2, 4, dtype=torch.bfloat16),
+                torch.tensor([0, 7, 16], dtype=torch.int64),
+                self._future_metadata(),
+            ),
+            (
+                "episode_length mismatch",
+                torch.zeros(3, 2, 4, dtype=torch.bfloat16),
+                torch.tensor([0, 8, 16], dtype=torch.int64),
+                self._future_metadata(episode_length=18),
+            ),
+        )
+        for error, features, anchors, metadata in cases:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "libero_goal_no_noops_1.0.0_lerobot"
+                _write_teacher(root, features, anchors, metadata)
+                with self.assertRaisesRegex(ValueError, error):
+                    EpisodeTeacherStore(
+                        root,
+                        self._future_spec(),
+                        [0],
+                        episode_lengths={0: 17},
+                    )
 
     def test_chunked_aligner_matches_unchunked_and_backpropagates(self):
         """分块 cross-attention 应与完整计算等价，且梯度可回传到输入和 query。"""
@@ -103,6 +205,87 @@ class Space2ActTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(adapted[key][0], checkpoint[key][0]))
         self.assertTrue(torch.equal(adapted[key][3], current_weight[3]))
+
+    def test_stage2_checkpoint_adds_only_future_mapper(self):
+        """Stage 1 热启动应恢复已有参数，并只保留新 future mapper 的初始化。"""
+        current = {
+            "backbone.weight": torch.tensor([1.0]),
+            "alignment_heads.spatial.weight": torch.tensor([2.0]),
+            "alignment_heads.future.weight": torch.tensor([3.0]),
+        }
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+
+        class FakeFramework:
+            space2act_stage = 2
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object()}
+
+            def state_dict(self):
+                return current
+
+        checkpoint = {
+            "backbone.weight": torch.tensor([10.0]),
+            "alignment_heads.spatial.weight": torch.tensor([20.0]),
+        }
+        adapted = QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(FakeFramework(), checkpoint)
+        self.assertTrue(torch.equal(adapted["backbone.weight"], checkpoint["backbone.weight"]))
+        self.assertTrue(
+            torch.equal(
+                adapted["alignment_heads.spatial.weight"],
+                checkpoint["alignment_heads.spatial.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(adapted["alignment_heads.future.weight"], current["alignment_heads.future.weight"])
+        )
+
+    def test_stage2_rejects_non_space2act_checkpoint(self):
+        """Stage 2 不允许绕过课程学习直接加载普通 base checkpoint。"""
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+
+        class FakeFramework:
+            space2act_stage = 2
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object()}
+
+            def state_dict(self):
+                return {"backbone.weight": torch.tensor([1.0])}
+
+        with self.assertRaisesRegex(ValueError, "must warm-start"):
+            QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(
+                FakeFramework(), {"backbone.weight": torch.tensor([2.0])}
+            )
+
+    def test_stage2_yaml_and_shell_contract(self):
+        """Stage 2 配置应固定 teacher shape，并保持 shell 顶部直接赋默认值。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        config_path = (
+            repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml"
+        )
+        cfg = OmegaConf.load(config_path)
+        future = cfg.framework.latent_reasoning.channels.future
+        teacher = cfg.datasets.vla_data.teacher_latents.channels.future
+        self.assertEqual((future.target_tokens, future.target_dim), (1125, 3072))
+        self.assertEqual(teacher.anchor_stride, 8)
+        self.assertEqual(teacher.expected_metadata.block_index, "20")
+        self.assertEqual(teacher.expected_metadata.saved_denoise_step, "19")
+
+        shell_paths = (
+            repo_root / "examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh",
+            repo_root
+            / "examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh",
+            repo_root
+            / "examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh",
+        )
+        default_expansion = re.compile(r"\$\{[^}]*:-")
+        for shell_path in shell_paths:
+            text = shell_path.read_text()
+            self.assertIsNone(default_expansion.search(text), shell_path)
 
     @staticmethod
     def _sampling_dataset(seed: int) -> LeRobotMixtureDataset:

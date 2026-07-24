@@ -20,6 +20,10 @@ class TeacherChannelSpec:
     target_dim: int
     feature_key: str = "features"
     anchor_key: str = "anchor_frames"
+    feature_dtype: str | None = None
+    anchor_dtype: str | None = None
+    anchor_stride: int | None = None
+    validate_episode_length: bool = False
     expected_metadata: dict[str, str] | None = None
 
     @classmethod
@@ -48,18 +52,58 @@ class TeacherChannelSpec:
             target_dim=int(target_dim),
             feature_key=str(config.get("feature_key", "features")),
             anchor_key=str(config.get("anchor_key", "anchor_frames")),
+            feature_dtype=(
+                str(config.get("feature_dtype")) if config.get("feature_dtype", None) is not None else None
+            ),
+            anchor_dtype=(
+                str(config.get("anchor_dtype")) if config.get("anchor_dtype", None) is not None else None
+            ),
+            anchor_stride=(
+                int(config.get("anchor_stride")) if config.get("anchor_stride", None) is not None else None
+            ),
+            validate_episode_length=config.get("validate_episode_length", False)
+            in (True, "True", "true", 1),
             expected_metadata={
                 str(key): str(value) for key, value in config.get("expected_metadata", {}).items()
             },
         )
 
 
+def _canonical_dtype(dtype: str) -> str:
+    """Normalize safetensors header names and config names to one spelling."""
+    aliases = {
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "f16": "float16",
+        "float16": "float16",
+        "f32": "float32",
+        "float32": "float32",
+        "i16": "int16",
+        "int16": "int16",
+        "i32": "int32",
+        "int32": "int32",
+        "i64": "int64",
+        "int64": "int64",
+    }
+    normalized = str(dtype).lower()
+    return aliases.get(normalized, normalized)
+
+
 class EpisodeTeacherStore:
     """启动时索引 episode 文件，训练时只读取当前样本对应的一个 anchor 切片。"""
 
-    def __init__(self, dataset_path: Path, spec: TeacherChannelSpec, episode_ids) -> None:
+    def __init__(
+        self,
+        dataset_path: Path,
+        spec: TeacherChannelSpec,
+        episode_ids,
+        episode_lengths: dict[int, int] | None = None,
+    ) -> None:
         self.dataset_path = Path(dataset_path)
         self.spec = spec
+        self._episode_lengths = {
+            int(episode_id): int(length) for episode_id, length in (episode_lengths or {}).items()
+        }
         teacher_root = self.dataset_path / spec.relative_dir
         if not teacher_root.is_dir():
             raise FileNotFoundError(
@@ -112,6 +156,13 @@ class EpisodeTeacherStore:
                 raise ValueError(
                     f"Teacher metadata episode_index={metadata['episode_index']} does not match {path}"
                 )
+            if "suite" in metadata:
+                suite = metadata["suite"]
+                dataset_name = self.dataset_path.name
+                if dataset_name != suite and not dataset_name.startswith(f"{suite}_"):
+                    raise ValueError(
+                        f"Teacher metadata suite={suite!r} does not match dataset {dataset_name}"
+                    )
             keys = set(reader.keys())
             required = {self.spec.feature_key, self.spec.anchor_key}
             if not required.issubset(keys):
@@ -122,6 +173,8 @@ class EpisodeTeacherStore:
             # 整体搬入内存。约定为 [anchor数, teacher token数, teacher维度]。
             feature_shape = tuple(features.get_shape())
             anchor_shape = tuple(anchors.get_shape())
+            feature_dtype = _canonical_dtype(features.get_dtype())
+            anchor_dtype = _canonical_dtype(anchors.get_dtype())
             expected_tail = (self.spec.target_tokens, self.spec.target_dim)
             if len(feature_shape) != 3 or feature_shape[1:] != expected_tail:
                 raise ValueError(
@@ -132,10 +185,51 @@ class EpisodeTeacherStore:
                 raise ValueError(
                     f"Teacher anchors mismatch in {path}: features={feature_shape}, anchors={anchor_shape}"
                 )
+            if self.spec.feature_dtype is not None and feature_dtype != _canonical_dtype(
+                self.spec.feature_dtype
+            ):
+                raise ValueError(
+                    f"Teacher feature dtype mismatch in {path}: got {feature_dtype}, "
+                    f"expected {_canonical_dtype(self.spec.feature_dtype)}"
+                )
+            if self.spec.anchor_dtype is not None and anchor_dtype != _canonical_dtype(
+                self.spec.anchor_dtype
+            ):
+                raise ValueError(
+                    f"Teacher anchor dtype mismatch in {path}: got {anchor_dtype}, "
+                    f"expected {_canonical_dtype(self.spec.anchor_dtype)}"
+                )
             anchor_values = reader.get_tensor(self.spec.anchor_key).to(torch.long)
             # anchor 很小，可以常驻 CPU；严格递增保证 searchsorted 的时序映射有效。
             if anchor_values.numel() == 0 or torch.any(anchor_values[1:] <= anchor_values[:-1]):
                 raise ValueError(f"Teacher anchors must be non-empty and strictly increasing in {path}")
+            if int(anchor_values[0]) != 0:
+                raise ValueError(f"Teacher anchors must start at frame 0 in {path}")
+            if self.spec.anchor_stride is not None and anchor_values.numel() > 1:
+                strides = anchor_values[1:] - anchor_values[:-1]
+                if torch.any(strides != self.spec.anchor_stride):
+                    raise ValueError(
+                        f"Teacher anchor stride mismatch in {path}: expected {self.spec.anchor_stride}"
+                    )
+
+            episode_length = self._episode_lengths.get(episode_id)
+            if self.spec.validate_episode_length:
+                if episode_length is None:
+                    raise ValueError(f"Episode length is required to validate teacher anchors in {path}")
+                metadata_length = metadata.get("episode_length")
+                if metadata_length is None or int(metadata_length) != episode_length:
+                    raise ValueError(
+                        f"Teacher episode_length mismatch in {path}: metadata={metadata_length}, "
+                        f"dataset={episode_length}"
+                    )
+                if self.spec.anchor_stride is None:
+                    raise ValueError("validate_episode_length requires anchor_stride")
+                expected_anchors = torch.arange(0, episode_length, self.spec.anchor_stride)
+                if not torch.equal(anchor_values, expected_anchors):
+                    raise ValueError(
+                        f"Teacher anchors do not cover episode {episode_id} with stride "
+                        f"{self.spec.anchor_stride} in {path}"
+                    )
             self._anchors[episode_id] = anchor_values
 
     def get(self, episode_id: int, frame_index: int) -> torch.Tensor:
@@ -150,7 +244,12 @@ class EpisodeTeacherStore:
             return reader.get_slice(self.spec.feature_key)[anchor_index].contiguous()
 
 
-def build_teacher_stores(dataset_path: Path, data_cfg: Any, episode_ids) -> dict[str, EpisodeTeacherStore]:
+def build_teacher_stores(
+    dataset_path: Path,
+    data_cfg: Any,
+    episode_ids,
+    episode_lengths: dict[int, int] | None = None,
+) -> dict[str, EpisodeTeacherStore]:
     """仅为 enabled 的 S/F/P 通道创建 store，未启用通道不触发文件依赖。"""
     teacher_cfg = data_cfg.get("teacher_latents", None) if data_cfg is not None else None
     if not teacher_cfg:
@@ -161,5 +260,7 @@ def build_teacher_stores(dataset_path: Path, data_cfg: Any, episode_ids) -> dict
         if channel_cfg.get("enabled", False) not in (True, "True", "true", 1):
             continue
         spec = TeacherChannelSpec.from_config(str(name), channel_cfg)
-        stores[str(name)] = EpisodeTeacherStore(dataset_path, spec, episode_ids)
+        stores[str(name)] = EpisodeTeacherStore(
+            dataset_path, spec, episode_ids, episode_lengths=episode_lengths
+        )
     return stores

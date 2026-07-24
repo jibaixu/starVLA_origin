@@ -654,8 +654,15 @@ class LeRobotSingleDataset(Dataset):
 
         # 每个启用的 S/F/P 通道分别建立一个轻量索引。初始化阶段只缓存
         # episode 文件路径和 anchor，不把体积较大的 teacher feature 常驻内存。
+        episode_lengths = {
+            int(episode_id): int(length)
+            for episode_id, length in zip(self._trajectory_ids, self._trajectory_lengths)
+        }
         self._teacher_stores = build_teacher_stores(
-            self.dataset_path, self.data_cfg, self._trajectory_ids
+            self.dataset_path,
+            self.data_cfg,
+            self._trajectory_ids,
+            episode_lengths=episode_lengths,
         )
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()

@@ -35,13 +35,14 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
     name: str = "QwenSpace2ActGR00T"
     latent_reasoning: dict = field(
         default_factory=lambda: {
+            "stage": 1,
             "routing_mode": "native_causal",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
             "channels": {
                 "spatial": _channel_defaults(True, True, 1521, 5120),
-                # future/plan 的提取契约确定前保留空 shape，防止误启用未准备好的监督。
-                "future": _channel_defaults(False, False, None, None),
+                "future": _channel_defaults(False, False, 1125, 3072),
+                # plan 的提取契约确定前保留空 shape，防止误启用未准备好的监督。
                 "plan": _channel_defaults(False, False, None, None),
             },
         }
@@ -56,6 +57,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         config = merge_framework_config(QwenSpace2ActGR00TDefaultConfig, config)
         super().__init__(config=config, **kwargs)
         latent_cfg = self.config.framework.latent_reasoning
+        self.space2act_stage = int(latent_cfg.get("stage", 1))
         # 首版只支持 Qwen 原生因果路由。若配置写入尚未实现的 mask 模式，
         # 在模型构造阶段直接失败，避免训练时产生与预期不同的信息流。
         if latent_cfg.routing_mode != "native_causal":
@@ -173,7 +175,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         return losses
 
     def adapt_checkpoint_state_dict(self, checkpoint: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """加载旧 checkpoint 时只扩展 Qwen 词表矩阵，并保护新 reasoning token。"""
+        """适配 base/前一阶段 checkpoint，并严格约束 Stage 1 -> Stage 2 的新增参数。"""
         current = self.state_dict()
         adapted = dict(checkpoint)
         allowed_suffixes = ("embed_tokens.weight", "lm_head.weight")
@@ -205,4 +207,40 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                     valid_ids = [token_id for token_id in protected_token_ids if token_id < target.shape[0]]
                     expanded[valid_ids] = target.detach().cpu()[valid_ids]
                 adapted[key] = expanded
+
+        if getattr(self, "space2act_stage", 1) >= 2:
+            if not is_space2act_checkpoint:
+                raise ValueError("Space2Act Stage 2 must warm-start from a Stage 1 Space2Act checkpoint")
+
+            checkpoint_channels = {
+                key.split(".", 2)[1]
+                for key in checkpoint
+                if key.startswith("alignment_heads.") and len(key.split(".", 2)) == 3
+            }
+            active_channels = set(self.alignment_heads.keys())
+            if "spatial" not in checkpoint_channels:
+                raise ValueError("Stage 1 checkpoint is missing the spatial alignment head")
+            unexpected_channels = checkpoint_channels - active_channels
+            if unexpected_channels:
+                raise ValueError(
+                    f"Checkpoint contains alignment channels not enabled in Stage 2: {sorted(unexpected_channels)}"
+                )
+
+            new_channels = active_channels - checkpoint_channels
+            if new_channels != {"future"}:
+                raise ValueError(
+                    "Stage 2 expects exactly one newly initialized alignment channel: future; "
+                    f"got {sorted(new_channels)}"
+                )
+            for key, value in current.items():
+                if any(key.startswith(f"alignment_heads.{channel}.") for channel in new_channels):
+                    adapted[key] = value.detach().cpu().clone()
+
+            missing = sorted(set(current) - set(adapted))
+            unexpected = sorted(set(adapted) - set(current))
+            if missing or unexpected:
+                raise ValueError(
+                    "Stage 1 checkpoint is incompatible with Stage 2 after adding the future mapper: "
+                    f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+                )
         return adapted
