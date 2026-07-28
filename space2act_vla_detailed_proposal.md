@@ -16,7 +16,7 @@ hidden sequence；GR00T ActionHead 以该完整序列作为 cross-attention KV�
 - Stage 3 的 Moto 监督是 `[32, 32]`：以当前 frame 为 anchor，在 16-frame future window 内构造 `0:4/4:8/8:12/12:16` 四个连续 delta-4 motion segment。每段保留 8 个、维度 32 的量化前 latent，按 segment-major 顺序拼接为 32 个目标 token。
 - 对齐损失是逐 token LayerNorm 后的 cosine + `0.1 * MSE`；总损失为 GR00T action loss 加启用通道的加权 alignment loss。
 - `token_enabled` 与 `alignment_enabled` 独立，支持同 token 数无 teacher loss 的 random-token control。
-- Stage 1/2/3 的课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。Stage 3 支持两种互不混淆的启动语义：推荐的课程训练从 Stage 2 checkpoint 热启动；`INIT_CHECKPOINT=""` 则运行从 Qwen 基座开始的 cold-start 消融。
+- Stage 1/2/3 的 legacy 课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。另有独立 progressive 入口：从第 0 步固定 S/F/P 序列，在单次 100k optimizer 轨迹中只调度教师权重；旧流程继续用于 checkpoint 课程和消融。
 
 对应实现入口为：
 
@@ -24,6 +24,7 @@ hidden sequence；GR00T ActionHead 以该完整序列作为 cross-attention KV�
 - `starVLA/model/modules/latent_reasoning/space2act_alignment.py`
 - `examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
@@ -36,8 +37,9 @@ Stage 3 已完成 Moto 全量 cache、plan shape/metadata 校验、Stage 2 -> 3 
 4 卡 ZeRO-2 上完成一次真实的前向、反向、optimizer step 和 checkpoint 保存，action、三路
 alignment 与 total loss 均为有限值。当前机器上的 Moto cache 已覆盖 1693 episodes；但
 LingBot/Wan cache 各 suite 只有 episode 0/1/2，因此全量 Stage 3 训练仍需先补齐这两类 cache。
-推荐的课程实验还需填写正式 Stage 2 `INIT_CHECKPOINT`；100k-step Stage 3 训练和四套件成功率
-结果尚未执行。
+legacy 课程实验还需填写正式 Stage 2 `INIT_CHECKPOINT`。固定序列 progressive schedule、
+global-step 传递和梯度诊断代码已经接入，但 100k-step progressive/legacy Stage 3 训练与四套件
+成功率结果均尚未执行。
 
 下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout 或额外 resampler 的内容，均应视为后续研究选项，而非第一版实现承诺。
 
@@ -456,8 +458,8 @@ $$
 + \lambda_F\mathcal{L}_F.
 $$
 
-默认配置中 $\lambda_S=\lambda_F=1.0$，暂未实现动态辅助损失调度或
-$\mathcal{L}_{SF}$。训练入口默认运行 100k optimization steps，future teacher 目录为
+legacy 默认配置中 $\lambda_S=\lambda_F=1.0$，不启用 progressive loss schedule 或
+$\mathcal{L}_{SF}$。旧训练入口默认运行 100k optimization steps，future teacher 目录为
 `wan2_2_future_latent_h16_step20_block20z_stride8_480x480`。`token_enabled` 和
 `alignment_enabled` 仍可独立覆盖，用于 random-token、token-only 或单教师消融。
 
@@ -481,7 +483,7 @@ Stage 3 已实现，并由 `run_space2act_train.sh` 作为默认训练阶段。�
 空值只选择消融训练语义，不会放宽非空 checkpoint 的 shape、键集合或课程阶段校验。Stage 2
 也遵循同一规则：空值可做 cold-start 消融，非空值仍必须满足 Stage 1/2 的严格迁移契约。
 
-本阶段插入 $S+F+P$ token，启用三路 teacher alignment。当前 MVP 训练损失固定为：
+legacy Stage 3 插入 $S+F+P$ token，启用三路 teacher alignment，固定损失为：
 
 $$
 \mathcal{L}_{act}
@@ -490,24 +492,39 @@ $$
 + \lambda_P\mathcal{L}_P.
 $$
 
-默认 $\lambda_S=\lambda_F=\lambda_P=1.0$，训练预算为新的 100k optimization steps，plan
-teacher 使用上述 stride-1 `[32,32]` cache。第一版不加入 $\mathcal{L}_{SF}$、
-$\mathcal{L}_{FP}$、teacher dropout 或动态 loss schedule，避免在验证 Moto 监督价值前混入额外
-变量；这些只保留为后续消融。启动脚本默认 `SPACE2ACT_EPISODES=null` 使用全量数据，但 loader
+legacy 默认 $\lambda_S=\lambda_F=\lambda_P=1.0$，每一阶段拥有独立训练预算，plan teacher
+使用上述 stride-1 `[32,32]` cache。该模式不加入 $\mathcal{L}_{SF}$、$\mathcal{L}_{FP}$、
+teacher dropout 或动态调权，继续作为逐阶段 checkpoint 与 fixed-loss 消融。启动脚本默认
+`SPACE2ACT_EPISODES=null` 使用全量数据，但 loader
 会在创建 dataset 时检查三类 teacher 是否覆盖所有选中 episode，因此任一缓存不完整都会在训练
 前失败。当前本机只有 episode 0/1/2 具备完整 S/F/P 三教师，可把该列表显式写入脚本做 pilot。
 
-### 3.3 联合训练替代方案
+### 3.3 固定序列 progressive 三阶段主实验
 
-如果算力充足，也可以从一开始加入全部 token 并联合训练，但建议使用 loss ramp-up：
+`run_space2act_progressive_train.sh` 不复用 legacy Stage 1/2 checkpoint，而是从相同 Qwen 基座
+cold-start。模型从第 0 步起固定插入 S/F/P，并构造三路 mapper；因此 ActionHead 读取的完整
+hidden KV 长度、token 位置和 optimizer 参数集合在 100k 内保持不变。“三阶段”只表示教师
+loss 的课程变化，action loss 始终以 1.0 权重训练，旧教师也以较低权重继续参与：
 
-```text
-early:   L_act + small L_S
-middle:  L_act + L_S + ramp(L_F)
-late:    L_act + L_S + L_F + ramp(L_P + L_consistency)
-```
+| optimization step | $\lambda_S$ | $\lambda_F$ | $\lambda_P$ | 说明 |
+|---:|---:|---:|---:|---|
+| 0 | 0.00 | 0.00 | 0.00 | action-only 起点，三组 token 已存在 |
+| 5k | 0.30 | 0.00 | 0.00 | spatial warmup 完成 |
+| 20k | 0.30 | 0.00 | 0.00 | 开始第一次 crossfade |
+| 25k | 0.10 | 0.20 | 0.00 | future 阶段稳定权重 |
+| 50k | 0.10 | 0.20 | 0.00 | 开始第二次 crossfade |
+| 55k | 0.05 | 0.10 | 0.15 | plan 阶段稳定权重 |
+| 100k | 0.05 | 0.10 | 0.15 | 最终权重 |
 
-联合训练的优点是三类 token 可以更早协同；缺点是更容易出现 token role collapse，即所有 token 都变成 action head 的普通上下文容量。若采用联合训练，必须保留容量匹配 baseline、role probe 和 token masking 实验。
+相邻节点间使用线性插值；5k 之后辅助权重总和固定为 0.30，避免教师数量增加时总辅助尺度
+从一份膨胀为三份。权重为零的 mapper 跳过计算，但对应 typed token 仍通过 action loss 更新。
+每 1000 步额外记录各有效辅助目标相对 Qwen 最后一层 hidden 的加权梯度范数，以及其在对应
+typed-token 位置与 action 梯度的 cosine。第一版只做诊断，不自动应用 GradNorm/PCGrad。
+
+已有 $\lambda_S=1.0$ 的 Stage 1 在 80k 获得最佳 LIBERO rollout success，它保留为 strong-S
+legacy 对照。它不作为 progressive 主实验起点，因为其序列结构、loss 历史和已消耗步数与新的
+等算力 100k 设计不同。Progressive 必须保留 action-only fixed-token、direct-joint fixed-token、
+typed-token masking 和 role probe，排除收益仅来自额外上下文容量或 token role collapse。
 
 ## 4. 实验方案
 
@@ -693,8 +710,9 @@ loss 只作为诊断指标。
 3. 已完成 Wan2.2 future teacher 抽取协议、smoke cache 和 StarVLA Stage 2 训练/评估代码接入。
 4. 已完成 Moto epoch-10 全量 `[273465,32,32]` 等价分 episode cache，以及 Stage 3 plan loader、Stage 2 -> 3 checkpoint 迁移、训练/评估脚本和单元测试。
 5. 补齐或迁移全量 LingBot/Wan cache，并对四个 suite 做 1693-episode 三教师联合审计；当前本机联合审计只覆盖每个 suite 的 episode 0/1/2。
-6. 已用空 `INIT_CHECKPOINT` 完成 Stage 3 cold-start 的 4 卡 ZeRO-2 单步训练与保存验证；下一步从选定 Stage 2 checkpoint 启动正式 100k-step Stage 3，并对 checkpoint 序列运行四套件 teacher-free 评估，报告 success、latency、S/F/P token masking 与 action-latent probe。
-7. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 等矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout 和跨角色一致性损失。
+6. 已用空 `INIT_CHECKPOINT` 完成 legacy Stage 3 cold-start 的 4 卡 ZeRO-2 单步训练与保存验证；固定序列 progressive 入口、0.30 总辅助预算和 hidden-gradient 诊断也已实现。
+7. 分别运行 100k action-only fixed-token、direct-joint 和 progressive 三个等算力主实验，在 20k/50k/80k/100k 执行四套件 teacher-free 评估，并报告 success、S/F/P masking、alignment 与梯度冲突指标；已有 80k strong-S checkpoint 单独作为非等配方 legacy 对照。
+8. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 等矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout 和跨角色一致性损失。
 
 如果资源受限，优先顺序建议为：
 

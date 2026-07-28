@@ -20,7 +20,11 @@ from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
     TeacherChannelSpec,
 )
 from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
-from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import QwenSpace2Act_GR00T
+from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
+    QwenSpace2Act_GR00T,
+    _interpolate_loss_schedule,
+    _normalize_loss_schedule,
+)
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 
 
@@ -282,6 +286,124 @@ class Space2ActTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Expected teacher shape"):
             aligner.compute_loss(torch.randn(1, 4, 8), [torch.randn(6, 6)])
 
+    def test_progressive_schedule_interpolates_fixed_auxiliary_budget(self):
+        """Progressive knots 应平滑交叉渐变，并在 warmup 后保持 0.30 总预算。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        cfg = OmegaConf.load(
+            repo_root / "examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml"
+        )
+        knots = _normalize_loss_schedule(
+            OmegaConf.merge(cfg.framework.latent_reasoning.loss_schedule, {"enabled": True}),
+            {"spatial", "future", "plan"},
+        )
+
+        expected = {
+            0: (0.0, 0.0, 0.0),
+            2500: (0.15, 0.0, 0.0),
+            5000: (0.30, 0.0, 0.0),
+            22500: (0.20, 0.10, 0.0),
+            52500: (0.075, 0.15, 0.075),
+            100000: (0.05, 0.10, 0.15),
+            120000: (0.05, 0.10, 0.15),
+        }
+        for step, values in expected.items():
+            with self.subTest(step=step):
+                weights = _interpolate_loss_schedule(knots, step)
+                actual = tuple(weights[channel] for channel in ("spatial", "future", "plan"))
+                self.assertTrue(np.allclose(actual, values), (step, actual))
+                if step >= 5000:
+                    self.assertAlmostEqual(sum(actual), 0.30)
+
+    def test_progressive_schedule_validation_rejects_ambiguous_contracts(self):
+        """Progressive 模式必须显式启用三通道，并使用完整、单调、非负 knots。"""
+        valid = {
+            "enabled": True,
+            "knots": [
+                {
+                    "step": 0,
+                    "weights": {"spatial": 0.3, "future": 0.0, "plan": 0.0},
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "requires all"):
+            _normalize_loss_schedule(valid, {"spatial", "future"})
+
+        invalid_cases = (
+            (
+                "strictly increasing",
+                [valid["knots"][0], valid["knots"][0]],
+            ),
+            (
+                "finite and non-negative",
+                [
+                    {
+                        "step": 0,
+                        "weights": {"spatial": -0.1, "future": 0.2, "plan": 0.2},
+                    }
+                ],
+            ),
+            (
+                "exactly spatial/future/plan",
+                [{"step": 0, "weights": {"spatial": 0.3, "future": 0.0}}],
+            ),
+        )
+        for error, knots in invalid_cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                _normalize_loss_schedule(
+                    {"enabled": True, "knots": knots},
+                    {"spatial", "future", "plan"},
+                )
+
+    def test_legacy_weights_ignore_step_and_progressive_requires_it(self):
+        """旧配置必须保持固定权重；progressive 则不得在缺少 global step 时静默运行。"""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.loss_schedule_enabled = False
+        framework.alignment_loss_weights = {"spatial": 1.0, "future": 0.3}
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 52500),
+            {"spatial": 1.0, "future": 0.3},
+        )
+
+        framework.loss_schedule_enabled = True
+        framework.loss_schedule_knots = (
+            (0, {"spatial": 0.0, "future": 0.0, "plan": 0.0}),
+            (10, {"spatial": 0.3, "future": 0.0, "plan": 0.0}),
+        )
+        with self.assertRaisesRegex(ValueError, "training_step is required"):
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, None)
+
+    def test_hidden_gradient_diagnostics_do_not_accumulate_parameter_grads(self):
+        """诊断使用 autograd.grad 读取 hidden 梯度，不应提前写入正常 backward 梯度。"""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        hidden = torch.randn(1, 6, 4, requires_grad=True)
+        action_loss = hidden.square().mean()
+        channel_losses = {
+            "spatial": hidden[:, 1:3].square().mean(),
+            "future": hidden[:, 3:5].square().mean(),
+        }
+        positions = {
+            "spatial": torch.tensor([[1, 2]]),
+            "future": torch.tensor([[3, 4]]),
+        }
+        weights = {"spatial": 0.1, "future": 0.2}
+
+        diagnostics = QwenSpace2Act_GR00T._compute_gradient_diagnostics(
+            framework,
+            hidden,
+            action_loss,
+            channel_losses,
+            positions,
+            weights,
+        )
+        self.assertIsNone(hidden.grad)
+        self.assertTrue(all(torch.isfinite(value) for value in diagnostics.values()))
+        self.assertGreater(diagnostics["gradient_cosine/spatial_vs_action"].item(), 0.0)
+
+        total_loss = action_loss + sum(weights[name] * loss for name, loss in channel_losses.items())
+        total_loss.backward()
+        self.assertIsNotNone(hidden.grad)
+        self.assertTrue(torch.isfinite(hidden.grad).all())
+
     def test_base_checkpoint_keeps_new_token_initialization(self):
         """加载旧 base 权重时，新增 Space2Act token 行应保留当前初始化值。"""
         key = "qwen_vl_interface.model.model.language_model.embed_tokens.weight"
@@ -495,6 +617,12 @@ class Space2ActTest(unittest.TestCase):
             text = shell_path.read_text()
             self.assertIsNone(default_expansion.search(text), shell_path)
 
+        progressive_path = (
+            repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh"
+        )
+        self.assertIsNone(default_expansion.search(progressive_path.read_text()), progressive_path)
+
         train_text = shell_paths[0].read_text()
         self.assertIn('SPACE2ACT_STAGE="3"', train_text)
         self.assertIn('INIT_CHECKPOINT=""', train_text)
@@ -588,6 +716,50 @@ class Space2ActTest(unittest.TestCase):
             )
             self.assertEqual(missing.returncode, 2)
             self.assertIn("INIT_CHECKPOINT does not exist", missing.stderr)
+
+    def test_progressive_training_shell_has_fixed_sequence_contract(self):
+        """新入口应单次 cold-start 100k，并始终启用 S/F/P token 和 teacher。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        path = (
+            repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh"
+        )
+        source = path.read_text()
+        dry_run_source = source.replace('DRY_RUN="0"', 'DRY_RUN="1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "progressive.sh"
+            script.write_text(dry_run_source)
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--framework.latent_reasoning.stage 3", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.enabled true", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.diagnostic_interval 1000", result.stdout)
+        for channel in ("spatial", "future", "plan"):
+            self.assertIn(
+                f"--framework.latent_reasoning.channels.{channel}.token_enabled true",
+                result.stdout,
+            )
+            self.assertIn(
+                f"--framework.latent_reasoning.channels.{channel}.alignment_enabled true",
+                result.stdout,
+            )
+        self.assertIn("--trainer.max_train_steps 100000", result.stdout)
+        self.assertIn("space2act_libero_progressive_sfp_100k", result.stdout)
+        self.assertNotIn("--trainer.pretrained_checkpoint", result.stdout)
+
+        trainer_source = (repo_root / "starVLA/training/train_starvla.py").read_text()
+        self.assertIn('forward_kwargs["training_step"] = self.completed_steps', trainer_source)
+        self.assertIn(
+            'forward_kwargs["run_gradient_diagnostics"] = self.accelerator.sync_gradients',
+            trainer_source,
+        )
 
     @staticmethod
     def _debug_option(argv: list[str], name: str) -> str:

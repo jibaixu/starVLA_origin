@@ -1,0 +1,217 @@
+run_id: space2act_libero_stage1
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: jinhuiye
+wandb_project: starVLA_Libero
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenSpace2ActGR00T
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    action_horizon: 8
+    repeated_diffusion_steps: 8
+  latent_reasoning:
+    # Stage 1/2/3 由启动脚本覆盖；写入 checkpoint config 后用于校验课程热启动。
+    stage: 1
+    # 当前实现沿用 Qwen 原生因果掩码，物理顺序为：
+    # images -> S -> instruction -> F -> P；block mask 留作后续消融。
+    routing_mode: native_causal
+    # avg 用现有词表均值初始化新增 token；normal 可用于随机 token 对照实验。
+    token_init_strategy: avg
+    # 目标 query 较多时分块计算 cross-attention，以降低峰值显存。
+    query_chunk_size: 128
+    # 默认关闭以保持 legacy Stage 1/2/3 的固定 loss_weight 行为。独立 progressive
+    # 脚本开启后，三路权重在单次 100k optimizer 轨迹中按 knots 线性插值。
+    loss_schedule:
+      enabled: false
+      diagnostic_interval: 0
+      knots:
+        - step: 0
+          weights: {spatial: 0.0, future: 0.0, plan: 0.0}
+        - step: 5000
+          weights: {spatial: 0.30, future: 0.0, plan: 0.0}
+        - step: 20000
+          weights: {spatial: 0.30, future: 0.0, plan: 0.0}
+        - step: 25000
+          weights: {spatial: 0.10, future: 0.20, plan: 0.0}
+        - step: 50000
+          weights: {spatial: 0.10, future: 0.20, plan: 0.0}
+        - step: 55000
+          weights: {spatial: 0.05, future: 0.10, plan: 0.15}
+        - step: 100000
+          weights: {spatial: 0.05, future: 0.10, plan: 0.15}
+    channels:
+      spatial:
+        # token_enabled 控制是否把 S token 插入 Qwen 序列；alignment_enabled
+        # 独立控制是否构建映射头并读取教师，可组合成“仅 token”消融。
+        token_enabled: true
+        token_count: 32
+        alignment_enabled: true
+        # target_tokens/target_dim 必须与单个教师特征 [N, D] 完全一致。
+        target_tokens: 1521
+        target_dim: 5120
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+      future:
+        token_enabled: false
+        token_count: 32
+        alignment_enabled: false
+        # Wan2.2 TI2V block 20 / final positive denoise step 的完整 T-H-W token。
+        target_tokens: 1125
+        target_dim: 3072
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+      plan:
+        token_enabled: false
+        token_count: 32
+        alignment_enabled: false
+        # 四段 delta-4 Moto pre-VQ latent：[4 segments x 8 queries, 32 dim]。
+        target_tokens: 32
+        target_dim: 32
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_all
+    # 与顶层训练 seed 分开保存，启动脚本默认让二者取相同值。
+    seed: 42
+    include_state: true
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    # 三阶段均沿用 base QwenGR00T 的文本输入契约，避免阶段切换时额外改变 prompt。
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    num_workers: 8
+    persistent_workers: true
+    # 本地试跑只读取每个子数据集的 episode 0、1、2，与当前已提取样例对应。
+    # 当服务器上所有 episode 的教师文件齐全后，可设为 null 使用完整数据集。
+    episode_indices: null
+    teacher_latents:
+      # 每个通道独立描述教师文件位置和张量契约。enabled 跟随模型侧
+      # alignment_enabled，关闭教师损失时不会建立索引或访问 latent 文件。
+      channels:
+        spatial:
+          enabled: ${framework.latent_reasoning.channels.spatial.alignment_enabled}
+          relative_dir: lingbot_latent_step4_numlayer24_stride16
+          target_tokens: ${framework.latent_reasoning.channels.spatial.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.spatial.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          anchor_stride: 16
+          validate_episode_length: true
+          expected_metadata:
+            # spatial 样例由 LingBot layer 24 提取，每 16 帧共享一个 latent；
+            # 加载时校验元数据，避免静默使用错误版本的教师特征。
+            complete: "true"
+            layer: "24"
+            share_stride: "16"
+            spatial_tokens: "1521"
+            feature_dim: "5120"
+        future:
+          enabled: ${framework.latent_reasoning.channels.future.alignment_enabled}
+          relative_dir: wan2_2_future_latent_h16_step20_block20z_stride8_480x480
+          target_tokens: ${framework.latent_reasoning.channels.future.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.future.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          anchor_stride: 8
+          validate_episode_length: true
+          expected_metadata:
+            complete: "true"
+            share_stride: "8"
+            block_index: "20"
+            block_indexing: zero_based
+            num_inference_steps: "20"
+            saved_denoise_step: "19"
+            saved_denoise_step_indexing: zero_based
+            cfg_branch: positive
+            target_tokens: "1125"
+            feature_dim: "3072"
+            temporal_tokens: "5"
+            token_h: "15"
+            token_w: "15"
+            token_order: temporal_height_width
+            dtype: bfloat16
+            height: "480"
+            width: "480"
+        plan:
+          enabled: ${framework.latent_reasoning.channels.plan.alignment_enabled}
+          relative_dir: moto_plan_latent_pre_vq_delta4x4_h16_stride1_epoch10
+          target_tokens: ${framework.latent_reasoning.channels.plan.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.plan.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          anchor_stride: 1
+          validate_episode_length: true
+          expected_metadata:
+            complete: "true"
+            checkpoint_epoch: "10"
+            checkpoint_step: "4690"
+            checkpoint_sha256: 4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46
+            fps: "20"
+            video_key: observation.images.image
+            share_stride: "1"
+            segment_delta: "4"
+            segment_count: "4"
+            segment_offsets: "0:4,4:8,8:12,12:16"
+            future_horizon_frames: "16"
+            target_tokens: "32"
+            feature_dim: "32"
+            queries_per_segment: "8"
+            latent_type: pre_vq
+            token_order: segment_major_query_major
+            dtype: bfloat16
+            tail_padding: repeat_last_frame
+            preprocessor: mae_imagenet_bicubic_224_eval
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    # VLM 接口、动作头和对齐头使用独立学习率，方便后续冻结或消融某一分支。
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+    alignment_heads: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ""
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  save_format: pt
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

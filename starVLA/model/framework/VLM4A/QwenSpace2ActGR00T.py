@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -13,6 +15,82 @@ from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig, Qwen_GR00T
 from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+
+
+_SPACE2ACT_CHANNELS = ("spatial", "future", "plan")
+
+
+def _is_enabled(value) -> bool:
+    return value in (True, "True", "true", 1)
+
+
+def _normalize_loss_schedule(schedule_cfg, active_channels) -> tuple[tuple[int, dict[str, float]], ...]:
+    """校验 progressive knots，并转换为只含 Python 标量的不可变结构。"""
+    if not schedule_cfg or not _is_enabled(schedule_cfg.get("enabled", False)):
+        return ()
+
+    expected_channels = set(_SPACE2ACT_CHANNELS)
+    active_channels = set(active_channels)
+    if active_channels != expected_channels:
+        raise ValueError(
+            "Progressive Space2Act loss_schedule requires all spatial/future/plan "
+            f"alignment channels, got {sorted(active_channels)}"
+        )
+
+    raw_knots = schedule_cfg.get("knots", None)
+    if not raw_knots:
+        raise ValueError("Progressive Space2Act loss_schedule requires non-empty knots")
+
+    normalized = []
+    previous_step = None
+    for index, knot in enumerate(raw_knots):
+        raw_step = knot.get("step", None)
+        if raw_step is None or isinstance(raw_step, bool) or int(raw_step) != float(raw_step):
+            raise ValueError(f"loss_schedule knot {index} has invalid step: {raw_step!r}")
+        step = int(raw_step)
+        if step < 0 or (previous_step is not None and step <= previous_step):
+            raise ValueError("loss_schedule knot steps must be non-negative and strictly increasing")
+
+        raw_weights = knot.get("weights", None)
+        if raw_weights is None or set(raw_weights.keys()) != expected_channels:
+            actual = sorted(raw_weights.keys()) if raw_weights is not None else []
+            raise ValueError(
+                "Every loss_schedule knot must define exactly spatial/future/plan weights, "
+                f"got {actual}"
+            )
+        weights = {str(channel): float(raw_weights[channel]) for channel in _SPACE2ACT_CHANNELS}
+        if any(not math.isfinite(weight) or weight < 0.0 for weight in weights.values()):
+            raise ValueError("loss_schedule weights must be finite and non-negative")
+        normalized.append((step, weights))
+        previous_step = step
+
+    if normalized[0][0] != 0:
+        raise ValueError("loss_schedule must start at step 0")
+    return tuple(normalized)
+
+
+def _interpolate_loss_schedule(
+    knots: tuple[tuple[int, dict[str, float]], ...], training_step: int
+) -> dict[str, float]:
+    """在相邻 knots 间按 optimization step 线性插值，范围外保持端点值。"""
+    if isinstance(training_step, bool) or int(training_step) != float(training_step):
+        raise ValueError(f"training_step must be an integer, got {training_step!r}")
+    step = max(0, int(training_step))
+    steps = [knot_step for knot_step, _ in knots]
+    right = bisect_right(steps, step)
+    if right == 0:
+        return dict(knots[0][1])
+    if right >= len(knots):
+        return dict(knots[-1][1])
+
+    left_step, left_weights = knots[right - 1]
+    right_step, right_weights = knots[right]
+    ratio = (step - left_step) / (right_step - left_step)
+    return {
+        channel: left_weights[channel]
+        + ratio * (right_weights[channel] - left_weights[channel])
+        for channel in _SPACE2ACT_CHANNELS
+    }
 
 
 def _channel_defaults(token_enabled: bool, alignment_enabled: bool, target_tokens, target_dim):
@@ -39,6 +117,11 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "routing_mode": "native_causal",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
+            "loss_schedule": {
+                "enabled": False,
+                "diagnostic_interval": 0,
+                "knots": [],
+            },
             "channels": {
                 "spatial": _channel_defaults(True, True, 1521, 5120),
                 "future": _channel_defaults(False, False, 1125, 3072),
@@ -98,8 +181,17 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             )
             self.alignment_loss_weights[str(channel)] = float(channel_cfg.get("loss_weight", 1.0))
 
-    def _typed_hidden(self, input_ids: torch.Tensor, hidden: torch.Tensor, channel: str) -> torch.Tensor:
-        """按 token id 从 Qwen 最后一层提取指定通道，返回 [B, K_channel, H_vlm]。"""
+        schedule_cfg = latent_cfg.get("loss_schedule", {})
+        self.loss_schedule_knots = _normalize_loss_schedule(
+            schedule_cfg, self.alignment_heads.keys()
+        )
+        self.loss_schedule_enabled = bool(self.loss_schedule_knots)
+        self.loss_diagnostic_interval = int(schedule_cfg.get("diagnostic_interval", 0))
+        if self.loss_diagnostic_interval < 0:
+            raise ValueError("loss_schedule diagnostic_interval must be non-negative")
+
+    def _typed_positions(self, input_ids: torch.Tensor, channel: str) -> torch.Tensor:
+        """返回每个样本中指定 typed token 的位置，形状为 [B,K_channel]。"""
         token_ids = self.qwen_vl_interface.space2act_token_ids[channel]
         rows = []
         for batch_index in range(input_ids.shape[0]):
@@ -113,10 +205,78 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                         f"Expected exactly one '{channel}' token id {token_id}, found {matches.numel()}"
                     )
                 positions.append(matches[0])
-            rows.append(hidden[batch_index, torch.stack(positions)])
+            rows.append(torch.stack(positions))
         return torch.stack(rows)
 
+    def _typed_hidden(
+        self,
+        input_ids: torch.Tensor,
+        hidden: torch.Tensor,
+        channel: str,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """按 token id 从 Qwen 最后一层提取指定通道，返回 [B,K_channel,H_vlm]。"""
+        if positions is None:
+            positions = self._typed_positions(input_ids, channel)
+        gather_index = positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1])
+        return torch.gather(hidden, dim=1, index=gather_index)
+
+    def _effective_alignment_weights(self, training_step: int | None) -> dict[str, float]:
+        if not self.loss_schedule_enabled:
+            return dict(self.alignment_loss_weights)
+        if training_step is None:
+            raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
+        return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
+
+    def _compute_gradient_diagnostics(
+        self,
+        last_hidden: torch.Tensor,
+        action_loss: torch.Tensor,
+        channel_losses: dict[str, torch.Tensor],
+        channel_positions: dict[str, torch.Tensor],
+        effective_weights: dict[str, float],
+    ) -> dict[str, torch.Tensor]:
+        """度量各辅助目标进入 Qwen 最后一层的梯度尺度与 action 冲突。"""
+        action_grad = torch.autograd.grad(
+            action_loss, last_hidden, retain_graph=True, create_graph=False
+        )[0].detach().float()
+        diagnostics = {
+            "gradient_norm/action_hidden": torch.linalg.vector_norm(action_grad),
+        }
+        aggregate_aux_grad = torch.zeros_like(action_grad)
+        eps = torch.finfo(torch.float32).eps
+
+        for channel, channel_loss in channel_losses.items():
+            weighted_loss = effective_weights[channel] * channel_loss
+            auxiliary_grad = torch.autograd.grad(
+                weighted_loss, last_hidden, retain_graph=True, create_graph=False
+            )[0].detach().float()
+            aggregate_aux_grad.add_(auxiliary_grad)
+
+            positions = channel_positions[channel]
+            gather_index = positions.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1])
+            action_typed_grad = torch.gather(action_grad, 1, gather_index).reshape(-1)
+            auxiliary_typed_grad = torch.gather(auxiliary_grad, 1, gather_index).reshape(-1)
+            action_norm = torch.linalg.vector_norm(action_typed_grad)
+            auxiliary_norm = torch.linalg.vector_norm(auxiliary_typed_grad)
+            cosine = torch.dot(action_typed_grad, auxiliary_typed_grad) / (
+                action_norm * auxiliary_norm + eps
+            )
+            diagnostics[f"gradient_norm/{channel}_alignment_hidden"] = auxiliary_norm
+            diagnostics[f"gradient_cosine/{channel}_vs_action"] = cosine
+
+        aggregate_norm = torch.linalg.vector_norm(aggregate_aux_grad)
+        action_norm = diagnostics["gradient_norm/action_hidden"]
+        diagnostics["gradient_norm/alignment_hidden"] = aggregate_norm
+        diagnostics["gradient_ratio/alignment_to_action_hidden"] = aggregate_norm / (
+            action_norm + eps
+        )
+        return {name: value.detach() for name, value in diagnostics.items()}
+
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
+        training_step = kwargs.pop("training_step", None)
+        run_gradient_diagnostics = kwargs.pop("run_gradient_diagnostics", True)
+        effective_weights = self._effective_alignment_weights(training_step)
         # 先保持基础 QwenGR00T 的样本字段约定，再额外读取 dataloader 注入的 teacher。
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
@@ -140,16 +300,40 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         # chunk 搬到 GPU，从而限制 1521x5120 等大目标的瞬时显存占用。
         losses = {}
         total_alignment_loss = last_hidden.new_zeros((), dtype=torch.float32)
+        channel_losses = {}
+        channel_positions = {}
         for channel, aligner in self.alignment_heads.items():
+            weight = effective_weights[channel]
+            losses[f"{channel}_alignment_weight"] = last_hidden.new_tensor(
+                weight, dtype=torch.float32
+            )
+            active = not self.loss_schedule_enabled or weight > 0.0
+            losses[f"{channel}_alignment_active"] = last_hidden.new_tensor(
+                float(active), dtype=torch.float32
+            )
+            if not active:
+                losses[f"{channel}_alignment_loss"] = last_hidden.new_zeros((), dtype=torch.float32)
+                losses[f"{channel}_weighted_alignment_loss"] = last_hidden.new_zeros(
+                    (), dtype=torch.float32
+                )
+                continue
+
             teacher_key = "space2act_teacher"
             if any(teacher_key not in example or channel not in example[teacher_key] for example in examples):
                 raise KeyError(f"Missing Space2Act teacher tensors for enabled channel '{channel}'")
-            compact_hidden = self._typed_hidden(qwen_inputs["input_ids"], last_hidden, channel)
+            positions = self._typed_positions(qwen_inputs["input_ids"], channel)
+            compact_hidden = self._typed_hidden(
+                qwen_inputs["input_ids"], last_hidden, channel, positions=positions
+            )
             teachers = [example[teacher_key][channel] for example in examples]
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 channel_loss = aligner.compute_loss(compact_hidden, teachers)
+            weighted_channel_loss = weight * channel_loss
             losses[f"{channel}_alignment_loss"] = channel_loss
-            total_alignment_loss = total_alignment_loss + self.alignment_loss_weights[channel] * channel_loss
+            losses[f"{channel}_weighted_alignment_loss"] = weighted_channel_loss
+            total_alignment_loss = total_alignment_loss + weighted_channel_loss
+            channel_losses[channel] = channel_loss
+            channel_positions[channel] = positions
 
         # action 分支继续沿用 GR00T 的 repeated diffusion 训练方式；attention mask、
         # state 和 Qwen hidden 按相同 repeats 扩展，保持 batch 维严格一致。
@@ -169,6 +353,32 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             action_loss = self.action_model(
                 action_hidden, action_target, state_repeated, encoder_attention_mask=action_mask
             )
+
+        if self.loss_schedule_enabled:
+            steps = [step for step, _ in self.loss_schedule_knots]
+            segment = max(0, min(bisect_right(steps, int(training_step)) - 1, len(steps) - 1))
+            losses["loss_schedule_segment"] = last_hidden.new_tensor(
+                float(segment), dtype=torch.float32
+            )
+            should_diagnose = (
+                bool(run_gradient_diagnostics)
+                and self.loss_diagnostic_interval > 0
+                and int(training_step) > 0
+                and int(training_step) % self.loss_diagnostic_interval == 0
+                and bool(channel_losses)
+                and torch.is_grad_enabled()
+                and last_hidden.requires_grad
+            )
+            if should_diagnose:
+                losses.update(
+                    self._compute_gradient_diagnostics(
+                        last_hidden,
+                        action_loss,
+                        channel_losses,
+                        channel_positions,
+                        effective_weights,
+                    )
+                )
 
         # trainer 优先反传 total_loss；同时保留分项，便于独立观察 action 与各教师损失。
         losses["action_loss"] = action_loss

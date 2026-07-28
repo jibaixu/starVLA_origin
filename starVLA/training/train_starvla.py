@@ -548,7 +548,15 @@ class VLATrainer(TrainerUtils):
             self.optimizer.zero_grad()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
+                forward_kwargs = {}
+                if str(self.config.framework.name) == "QwenSpace2ActGR00T":
+                    # Progressive Space2Act 以 optimization step（而非 micro-batch）
+                    # 插值教师权重；legacy 配置会收到该值但继续使用固定 loss_weight。
+                    forward_kwargs["training_step"] = self.completed_steps
+                    # 梯度累积期间只在同步 micro-batch 做一次诊断，避免
+                    # 同一 optimization step 重复执行 autograd.grad。
+                    forward_kwargs["run_gradient_diagnostics"] = self.accelerator.sync_gradients
+                output_dict = self.model.forward(batch_vla, **forward_kwargs)
                 action_loss = output_dict["action_loss"]
                 # Space2Act 的 total_loss = 动作损失 + 各教师对齐损失；基础框架
                 # 没有该字段时回退到 action_loss，使训练循环保持向后兼容。
