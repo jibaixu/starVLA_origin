@@ -42,8 +42,8 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "channels": {
                 "spatial": _channel_defaults(True, True, 1521, 5120),
                 "future": _channel_defaults(False, False, 1125, 3072),
-                # plan 的提取契约确定前保留空 shape，防止误启用未准备好的监督。
-                "plan": _channel_defaults(False, False, None, None),
+                # 四段 delta-4 Moto pre-VQ latent 按时间拼接为 [32, 32]。
+                "plan": _channel_defaults(False, False, 32, 32),
             },
         }
     )
@@ -58,6 +58,8 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         super().__init__(config=config, **kwargs)
         latent_cfg = self.config.framework.latent_reasoning
         self.space2act_stage = int(latent_cfg.get("stage", 1))
+        if self.space2act_stage not in (1, 2, 3):
+            raise ValueError(f"Space2Act stage must be 1, 2, or 3, got {self.space2act_stage}")
         # 首版只支持 Qwen 原生因果路由。若配置写入尚未实现的 mask 模式，
         # 在模型构造阶段直接失败，避免训练时产生与预期不同的信息流。
         if latent_cfg.routing_mode != "native_causal":
@@ -175,7 +177,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         return losses
 
     def adapt_checkpoint_state_dict(self, checkpoint: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """适配 base/前一阶段 checkpoint，并严格约束 Stage 1 -> Stage 2 的新增参数。"""
+        """适配 base/前一阶段 checkpoint，并严格约束课程迁移与同阶段恢复。"""
         current = self.state_dict()
         adapted = dict(checkpoint)
         allowed_suffixes = ("embed_tokens.weight", "lm_head.weight")
@@ -208,9 +210,12 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                     expanded[valid_ids] = target.detach().cpu()[valid_ids]
                 adapted[key] = expanded
 
-        if getattr(self, "space2act_stage", 1) >= 2:
+        stage = int(getattr(self, "space2act_stage", 1))
+        if stage >= 2:
             if not is_space2act_checkpoint:
-                raise ValueError("Space2Act Stage 2 must warm-start from a Stage 1 Space2Act checkpoint")
+                raise ValueError(
+                    f"Space2Act Stage {stage} must warm-start from a Space2Act checkpoint"
+                )
 
             checkpoint_channels = {
                 key.split(".", 2)[1]
@@ -218,20 +223,29 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                 if key.startswith("alignment_heads.") and len(key.split(".", 2)) == 3
             }
             active_channels = set(self.alignment_heads.keys())
-            if "spatial" not in checkpoint_channels:
-                raise ValueError("Stage 1 checkpoint is missing the spatial alignment head")
-            unexpected_channels = checkpoint_channels - active_channels
-            if unexpected_channels:
+            predecessor_channels, new_channel = {
+                2: ({"spatial"}, "future"),
+                3: ({"spatial", "future"}, "plan"),
+            }[stage]
+
+            if checkpoint_channels == active_channels:
+                # 同阶段 checkpoint 必须完整匹配当前 mapper 集合，供正常 resume/restart。
+                new_channels = set()
+            elif checkpoint_channels == predecessor_channels:
+                expected_active = predecessor_channels | {new_channel}
+                if active_channels != expected_active:
+                    raise ValueError(
+                        f"Stage {stage} warm-start requires active alignment channels "
+                        f"{sorted(expected_active)}, got {sorted(active_channels)}"
+                    )
+                new_channels = {new_channel}
+            else:
                 raise ValueError(
-                    f"Checkpoint contains alignment channels not enabled in Stage 2: {sorted(unexpected_channels)}"
+                    f"Stage {stage} expects a predecessor checkpoint with alignment channels "
+                    f"{sorted(predecessor_channels)} or a same-stage checkpoint with "
+                    f"{sorted(active_channels)}, got {sorted(checkpoint_channels)}"
                 )
 
-            new_channels = active_channels - checkpoint_channels
-            if new_channels != {"future"}:
-                raise ValueError(
-                    "Stage 2 expects exactly one newly initialized alignment channel: future; "
-                    f"got {sorted(new_channels)}"
-                )
             for key, value in current.items():
                 if any(key.startswith(f"alignment_heads.{channel}.") for channel in new_channels):
                     adapted[key] = value.detach().cpu().clone()
@@ -240,7 +254,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             unexpected = sorted(set(adapted) - set(current))
             if missing or unexpected:
                 raise ValueError(
-                    "Stage 1 checkpoint is incompatible with Stage 2 after adding the future mapper: "
+                    f"Checkpoint is incompatible with Space2Act Stage {stage}: "
                     f"missing={missing[:10]}, unexpected={unexpected[:10]}"
                 )
         return adapted

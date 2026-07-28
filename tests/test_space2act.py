@@ -1,10 +1,14 @@
 """Space2Act 教师、对齐映射、checkpoint 与采样 seed 的核心单元测试。"""
 
-from pathlib import Path
+import ast
 import re
+import subprocess
 import tempfile
-from types import SimpleNamespace
+import textwrap
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -155,6 +159,99 @@ class Space2ActTest(unittest.TestCase):
                         episode_lengths={0: 17},
                     )
 
+    @staticmethod
+    def _plan_spec() -> TeacherChannelSpec:
+        return TeacherChannelSpec(
+            "plan",
+            "latents",
+            32,
+            32,
+            feature_dtype="bfloat16",
+            anchor_dtype="int64",
+            anchor_stride=1,
+            validate_episode_length=True,
+            expected_metadata={
+                "complete": "true",
+                "checkpoint_epoch": "10",
+                "checkpoint_sha256": (
+                    "4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46"
+                ),
+                "segment_offsets": "0:4,4:8,8:12,12:16",
+                "latent_type": "pre_vq",
+            },
+        )
+
+    @staticmethod
+    def _plan_metadata(**overrides) -> dict[str, str]:
+        metadata = {
+            "complete": "true",
+            "checkpoint_epoch": "10",
+            "checkpoint_sha256": (
+                "4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46"
+            ),
+            "segment_offsets": "0:4,4:8,8:12,12:16",
+            "latent_type": "pre_vq",
+            "suite": "libero_goal",
+            "episode_index": "0",
+            "episode_length": "17",
+        }
+        metadata.update({key: str(value) for key, value in overrides.items()})
+        return metadata
+
+    def test_plan_teacher_contract_maps_every_frame(self):
+        """Stage 3 Moto teacher 应逐帧提供四段拼接后的 [32,32] pre-VQ latent。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "libero_goal_no_noops_1.0.0_lerobot"
+            features = torch.arange(17 * 32 * 32, dtype=torch.float32).reshape(17, 32, 32)
+            features = features.to(torch.bfloat16)
+            _write_teacher(
+                root,
+                features,
+                torch.arange(17, dtype=torch.int64),
+                self._plan_metadata(),
+            )
+            store = EpisodeTeacherStore(
+                root,
+                self._plan_spec(),
+                [0],
+                episode_lengths={0: 17},
+            )
+
+            self.assertTrue(torch.equal(store.get(0, 0), features[0]))
+            self.assertTrue(torch.equal(store.get(0, 9), features[9]))
+            self.assertTrue(torch.equal(store.get(0, 16), features[16]))
+
+    def test_plan_teacher_rejects_wrong_checkpoint_or_stride(self):
+        """Moto checkpoint 身份或逐帧 anchor 契约改变时，Stage 3 必须拒绝启动。"""
+        cases = (
+            (
+                "checkpoint_sha256",
+                torch.arange(17, dtype=torch.int64),
+                self._plan_metadata(checkpoint_sha256="wrong"),
+            ),
+            (
+                "stride mismatch",
+                torch.arange(0, 34, 2, dtype=torch.int64),
+                self._plan_metadata(),
+            ),
+        )
+        for error, anchors, metadata in cases:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "libero_goal_no_noops_1.0.0_lerobot"
+                _write_teacher(
+                    root,
+                    torch.zeros(17, 32, 32, dtype=torch.bfloat16),
+                    anchors,
+                    metadata,
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    EpisodeTeacherStore(
+                        root,
+                        self._plan_spec(),
+                        [0],
+                        episode_lengths={0: 17},
+                    )
+
     def test_chunked_aligner_matches_unchunked_and_backpropagates(self):
         """分块 cross-attention 应与完整计算等价，且梯度可回传到输入和 query。"""
         torch.manual_seed(0)
@@ -260,8 +357,104 @@ class Space2ActTest(unittest.TestCase):
                 FakeFramework(), {"backbone.weight": torch.tensor([2.0])}
             )
 
-    def test_stage2_yaml_and_shell_contract(self):
-        """Stage 2 配置应固定 teacher shape，并保持 shell 顶部直接赋默认值。"""
+    def test_stage3_checkpoint_adds_only_plan_mapper(self):
+        """Stage 2 热启动应恢复 S/F，并只保留新 plan mapper 的初始化。"""
+        current = {
+            "backbone.weight": torch.tensor([1.0]),
+            "alignment_heads.spatial.weight": torch.tensor([2.0]),
+            "alignment_heads.future.weight": torch.tensor([3.0]),
+            "alignment_heads.plan.weight": torch.tensor([4.0]),
+        }
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+
+        class FakeFramework:
+            space2act_stage = 3
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object(), "plan": object()}
+
+            def state_dict(self):
+                return current
+
+        checkpoint = {
+            "backbone.weight": torch.tensor([10.0]),
+            "alignment_heads.spatial.weight": torch.tensor([20.0]),
+            "alignment_heads.future.weight": torch.tensor([30.0]),
+        }
+        adapted = QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(FakeFramework(), checkpoint)
+        self.assertTrue(torch.equal(adapted["backbone.weight"], checkpoint["backbone.weight"]))
+        self.assertTrue(
+            torch.equal(
+                adapted["alignment_heads.spatial.weight"],
+                checkpoint["alignment_heads.spatial.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                adapted["alignment_heads.future.weight"],
+                checkpoint["alignment_heads.future.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(adapted["alignment_heads.plan.weight"], current["alignment_heads.plan.weight"])
+        )
+
+    def test_stage3_same_stage_checkpoint_resumes_all_mappers(self):
+        """Stage 3 restart/resume 不应重置已经训练过的 plan mapper。"""
+        current = {
+            "backbone.weight": torch.tensor([1.0]),
+            "alignment_heads.spatial.weight": torch.tensor([2.0]),
+            "alignment_heads.future.weight": torch.tensor([3.0]),
+            "alignment_heads.plan.weight": torch.tensor([4.0]),
+        }
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+
+        class FakeFramework:
+            space2act_stage = 3
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object(), "plan": object()}
+
+            def state_dict(self):
+                return current
+
+        checkpoint = {key: value + 10 for key, value in current.items()}
+        adapted = QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(FakeFramework(), checkpoint)
+        for key in current:
+            self.assertTrue(torch.equal(adapted[key], checkpoint[key]))
+
+    def test_stage3_rejects_stage1_checkpoint(self):
+        """Stage 3 不允许跳过 future 课程，直接从只有 spatial mapper 的 Stage 1 启动。"""
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+
+        class FakeFramework:
+            space2act_stage = 3
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object(), "plan": object()}
+
+            def state_dict(self):
+                return {
+                    "backbone.weight": torch.tensor([1.0]),
+                    "alignment_heads.spatial.weight": torch.tensor([2.0]),
+                    "alignment_heads.future.weight": torch.tensor([3.0]),
+                    "alignment_heads.plan.weight": torch.tensor([4.0]),
+                }
+
+        with self.assertRaisesRegex(ValueError, "predecessor checkpoint"):
+            QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(
+                FakeFramework(),
+                {
+                    "backbone.weight": torch.tensor([10.0]),
+                    "alignment_heads.spatial.weight": torch.tensor([20.0]),
+                },
+            )
+
+    def test_stage3_yaml_and_shell_contract(self):
+        """Stage 3 配置应锁定三教师契约，并保持 shell 顶部直接赋默认值。"""
         repo_root = Path(__file__).resolve().parents[1]
         config_path = (
             repo_root
@@ -275,6 +468,21 @@ class Space2ActTest(unittest.TestCase):
         self.assertEqual(teacher.expected_metadata.block_index, "20")
         self.assertEqual(teacher.expected_metadata.saved_denoise_step, "19")
 
+        plan = cfg.framework.latent_reasoning.channels.plan
+        plan_teacher = cfg.datasets.vla_data.teacher_latents.channels.plan
+        self.assertEqual((plan.target_tokens, plan.target_dim), (32, 32))
+        self.assertEqual(plan_teacher.anchor_stride, 1)
+        self.assertEqual(plan_teacher.feature_dtype, "bfloat16")
+        self.assertEqual(plan_teacher.expected_metadata.checkpoint_epoch, "10")
+        self.assertEqual(
+            plan_teacher.expected_metadata.checkpoint_sha256,
+            "4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46",
+        )
+        self.assertEqual(
+            plan_teacher.expected_metadata.segment_offsets,
+            "0:4,4:8,8:12,12:16",
+        )
+
         shell_paths = (
             repo_root / "examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh",
             repo_root
@@ -286,6 +494,184 @@ class Space2ActTest(unittest.TestCase):
         for shell_path in shell_paths:
             text = shell_path.read_text()
             self.assertIsNone(default_expansion.search(text), shell_path)
+
+        train_text = shell_paths[0].read_text()
+        self.assertIn('SPACE2ACT_STAGE="3"', train_text)
+        self.assertIn('INIT_CHECKPOINT=""', train_text)
+        self.assertIn('RUN_ID="space2act_libero_stage${SPACE2ACT_STAGE}_cold_start"', train_text)
+        self.assertIn('stage_tokens="spatial,future,plan"', train_text)
+        self.assertIn("teacher_latents.channels.plan.relative_dir", train_text)
+        self.assertNotIn("Stage 3 is not implemented", train_text)
+        self.assertNotIn("requires INIT_CHECKPOINT to point", train_text)
+
+        eval_text = shell_paths[1].read_text()
+        self.assertIn("space2act_libero_stage3", eval_text)
+        self.assertIn("steps_100000_pytorch_model.pt", eval_text)
+
+    def test_training_shell_supports_cold_start_and_strict_warm_start(self):
+        """空值应 cold-start；非空 checkpoint 应传入命令，且坏路径须提前失败。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (
+            repo_root / "examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh"
+        ).read_text()
+        dry_run_source = source.replace('DRY_RUN="0"', 'DRY_RUN="1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cold_script = Path(temp_dir) / "cold_start.sh"
+            cold_script.write_text(dry_run_source)
+            cold = subprocess.run(
+                ["bash", str(cold_script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(cold.returncode, 0, cold.stderr)
+            self.assertIn("space2act_libero_stage3_cold_start", cold.stdout)
+            self.assertNotIn("--trainer.pretrained_checkpoint", cold.stdout)
+
+            for stage, expected_run_id in (
+                (1, "space2act_libero_stage1"),
+                (2, "space2act_libero_stage2_cold_start"),
+            ):
+                stage_script = Path(temp_dir) / f"stage{stage}.sh"
+                stage_script.write_text(
+                    dry_run_source.replace('SPACE2ACT_STAGE="3"', f'SPACE2ACT_STAGE="{stage}"')
+                )
+                stage_run = subprocess.run(
+                    ["bash", str(stage_script)],
+                    cwd=repo_root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(stage_run.returncode, 0, stage_run.stderr)
+                self.assertIn(f"--run_id {expected_run_id}", stage_run.stdout)
+
+            warm_checkpoint = Path(temp_dir) / "stage2.pt"
+            warm_checkpoint.touch()
+            warm_script = Path(temp_dir) / "warm_start.sh"
+            warm_script.write_text(
+                dry_run_source.replace(
+                    'INIT_CHECKPOINT=""',
+                    f'INIT_CHECKPOINT="{warm_checkpoint}"',
+                )
+            )
+            warm = subprocess.run(
+                ["bash", str(warm_script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(warm.returncode, 0, warm.stderr)
+            self.assertIn("--run_id space2act_libero_stage3", warm.stdout)
+            self.assertNotIn("space2act_libero_stage3_cold_start", warm.stdout)
+            self.assertIn(
+                f"--trainer.pretrained_checkpoint {warm_checkpoint}",
+                warm.stdout,
+            )
+
+            missing_script = Path(temp_dir) / "missing_checkpoint.sh"
+            missing_script.write_text(
+                dry_run_source.replace(
+                    'INIT_CHECKPOINT=""',
+                    'INIT_CHECKPOINT="/definitely/missing/space2act_stage2.pt"',
+                )
+            )
+            missing = subprocess.run(
+                ["bash", str(missing_script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("INIT_CHECKPOINT does not exist", missing.stderr)
+
+    @staticmethod
+    def _debug_option(argv: list[str], name: str) -> str:
+        return argv[argv.index(name) + 1]
+
+    @staticmethod
+    def _commented_debug_argv(source: str, start_marker: str, end_marker: str) -> list[str]:
+        section = source.split(start_marker, 1)[1].split(end_marker, 1)[0]
+        uncommented = "\n".join(
+            line.replace("    # ", "    ", 1) if line.startswith("    # ") else line
+            for line in section.splitlines()
+        )
+        tree = ast.parse(textwrap.dedent(uncommented))
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "argv"
+        )
+        return ast.literal_eval(assignment.value)
+
+    def test_debug_on_has_runnable_stage_templates(self):
+        """debug_on 默认运行 Stage 3，同时保留参数完整的 Stage 1/2 注释模板。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        trainer_path = repo_root / "starVLA/training/train_starvla.py"
+        source = trainer_path.read_text()
+        module = ast.parse(source)
+        debug_function = next(
+            node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "debug_on"
+        )
+        namespace = {}
+        exec(compile(ast.Module(body=[debug_function], type_ignores=[]), trainer_path, "exec"), namespace)
+        with patch("sys.argv", ["train_starvla.py"]), patch.dict("os.environ", {}, clear=False):
+            namespace["debug_on"]()
+            stage3 = list(__import__("sys").argv)
+
+        stage1 = self._commented_debug_argv(
+            source,
+            "    # 第一阶段（需要时取消注释，并注释下方第三阶段）",
+            "    # 第二阶段（需要时取消注释，并注释下方第三阶段）",
+        )
+        stage2 = self._commented_debug_argv(
+            source,
+            "    # 第二阶段（需要时取消注释，并注释下方第三阶段）",
+            "    # 第三阶段",
+        )
+        stages = {1: stage1, 2: stage2, 3: stage3}
+        for stage, argv in stages.items():
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    self._debug_option(argv, "--framework.latent_reasoning.stage"), str(stage)
+                )
+                self.assertEqual(
+                    self._debug_option(argv, "--datasets.vla_data.episode_indices"), "[0,1,2]"
+                )
+                self.assertEqual(
+                    self._debug_option(
+                        argv, "--framework.latent_reasoning.channels.spatial.alignment_enabled"
+                    ),
+                    "true",
+                )
+                self.assertEqual(
+                    self._debug_option(
+                        argv, "--framework.latent_reasoning.channels.future.alignment_enabled"
+                    ),
+                    "true" if stage >= 2 else "false",
+                )
+                self.assertEqual(
+                    self._debug_option(
+                        argv, "--framework.latent_reasoning.channels.plan.alignment_enabled"
+                    ),
+                    "true" if stage == 3 else "false",
+                )
+                self.assertEqual(
+                    self._debug_option(argv, "--run_id"),
+                    f"debug_space2act_libero_stage{stage}_ep0_2",
+                )
+
+        self.assertNotIn("--trainer.pretrained_checkpoint", stage1)
+        self.assertEqual(self._debug_option(stage2, "--trainer.pretrained_checkpoint"), "")
+        self.assertEqual(self._debug_option(stage3, "--trainer.pretrained_checkpoint"), "")
+        self.assertIn("--datasets.vla_data.teacher_latents.channels.future.relative_dir", stage2)
+        self.assertIn("--datasets.vla_data.teacher_latents.channels.plan.relative_dir", stage3)
 
     @staticmethod
     def _sampling_dataset(seed: int) -> LeRobotMixtureDataset:

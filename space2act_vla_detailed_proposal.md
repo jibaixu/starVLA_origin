@@ -12,21 +12,32 @@ hidden sequence；GR00T ActionHead 以该完整序列作为 cross-attention KV�
 - 序列沿用 Qwen 原生 causal attention，物理顺序为 `images -> S -> instruction -> F -> P`。自定义 block-wise mask 是后续消融项，不属于当前 MVP。
 - 学生侧每个通道只有 32 个 compact token。训练期 mapper 使用与教师 token 数相同的 learned queries，通过 cross-attention 读取 compact hidden，再映射到教师维度；推理完全跳过 mapper。
 - Stage 1 的 LingBot 监督是 `[1521, 5120]`，mapper 为 `32 x 2560 -> 1521 x 5120`，内部维度 1024、8 heads、query chunk 128。
+- Stage 2 的 Wan2.2-TI2V-5B 监督是 `[1125, 3072]`：抓取 20-step rollout 的 final positive denoise step（zero-based step 19）、zero-based block 20 hidden，token 顺序为 `5 x 15 x 15` 的 T-H-W 展平。future mapper 为 `32 x 2560 -> 1125 x 3072`，同样使用 1024 内部维度、8 heads 和 query chunk 128。
+- Stage 3 的 Moto 监督是 `[32, 32]`：以当前 frame 为 anchor，在 16-frame future window 内构造 `0:4/4:8/8:12/12:16` 四个连续 delta-4 motion segment。每段保留 8 个、维度 32 的量化前 latent，按 segment-major 顺序拼接为 32 个目标 token。
 - 对齐损失是逐 token LayerNorm 后的 cosine + `0.1 * MSE`；总损失为 GR00T action loss 加启用通道的加权 alignment loss。
 - `token_enabled` 与 `alignment_enabled` 独立，支持同 token 数无 teacher loss 的 random-token control。
-- Stage 2/3 的接口、开关和 shape 校验已经预留，但 teacher shape 与路径在提取完成前保持未定义，启用时必须显式填写。
+- Stage 1/2/3 的课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。Stage 3 支持两种互不混淆的启动语义：推荐的课程训练从 Stage 2 checkpoint 热启动；`INIT_CHECKPOINT=""` 则运行从 Qwen 基座开始的 cold-start 消融。
 
 对应实现入口为：
 
 - `starVLA/model/framework/VLM4A/QwenSpace2ActGR00T.py`
 - `starVLA/model/modules/latent_reasoning/space2act_alignment.py`
 - `examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml`
-- `examples/simBenchmarks/LIBERO/train_files/run_space2act_train_jbx.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh`
+- `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
+- `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
-当前工程验证已经完成：四个 LIBERO suite 的 episode 0/1/2 可组成 2067-step pilot；8 卡
-ZeRO-2 单步训练成功得到有限的 action/alignment/total loss；保存后的 checkpoint 在不提供任何
-teacher tensor、且禁止 mapper 执行的条件下可输出形状为 `[1, 8, 7]` 的有限 action。因此
-“训练期 teacher + mapper、推理期仅 Qwen typed tokens + 原 GR00T ActionHead”的闭环已实际跑通。
+当前工程验证分为三层。Stage 1 已完成四个 LIBERO suite 的 episode 0/1/2 共 2067-step
+pilot、8 卡 ZeRO-2 单步训练和 checkpoint 推理验证；保存后的 checkpoint 在不提供 teacher
+tensor、且禁止 mapper 执行的条件下可输出形状为 `[1, 8, 7]` 的有限 action。Stage 2 已完成
+future smoke cache 的 shape/metadata 校验、数据加载、模型前向、课程热启动约束和评估脚本接入。
+Stage 3 已完成 Moto 全量 cache、plan shape/metadata 校验、Stage 2 -> 3 迁移约束、训练/评估
+脚本和三教师 episode 0/1/2 联合读取审计。空 `INIT_CHECKPOINT` 的 cold-start 路径也已在
+4 卡 ZeRO-2 上完成一次真实的前向、反向、optimizer step 和 checkpoint 保存，action、三路
+alignment 与 total loss 均为有限值。当前机器上的 Moto cache 已覆盖 1693 episodes；但
+LingBot/Wan cache 各 suite 只有 episode 0/1/2，因此全量 Stage 3 训练仍需先补齐这两类 cache。
+推荐的课程实验还需填写正式 Stage 2 `INIT_CHECKPOINT`；100k-step Stage 3 训练和四套件成功率
+结果尚未执行。
 
 下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout 或额外 resampler 的内容，均应视为后续研究选项，而非第一版实现承诺。
 
@@ -230,14 +241,14 @@ $$
 
 ### 2.5 未来状态推演 token 的中间层世界动态对齐
 
-未来教师记为 $T_f$，采用 Wan / BRIDGE-WA 类型的具身任务视频世界模型。教师需要先在机器人轨迹数据上预训练，使其输入当前机器人上下文时能够预测未来状态：
+未来教师记为 $T_f$。当前 Stage 2 使用在 LIBERO 17 帧窗口上适配的 Wan2.2-TI2V-5B；概念上也可以替换为 BRIDGE-WA 类型的具身任务视频世界模型。正式特征抽取时，教师只接收 anchor 时刻的当前 RGB 图像和原始任务文本，不读取真实未来帧或机器人 action，并执行 17 帧、20 denoise steps 的未来 rollout：
 
 $$
 W_t^{(\ell, \Delta)}
-= T_f^{(\ell)}(o_t, q_t, \ell_{\text{text}}, \Delta),
+= T_f^{(\ell)}(o_t, \ell_{\text{text}}, \Delta),
 $$
 
-其中 $\Delta$ 表示未来时间偏移，$W_t^{(\ell, \Delta)}$ 是教师在预测未来状态过程中的第 $\ell$ 层中间表征。
+其中 $\Delta$ 表示 rollout 覆盖的未来窗口，$W_t^{(\ell, \Delta)}$ 是教师在预测未来状态过程中的第 $\ell$ 层中间表征。训练 Wan teacher 时使用真实 17 帧窗口作为生成监督，与 StarVLA Stage 2 抽取时只输入当前帧的行为需要严格区分。
 
 本方案刻意不对齐最终层输出，而对齐中间层表征。理由如下：
 
@@ -246,19 +257,23 @@ $$
 - 中间层更可能保留任务条件、物体交互、变化区域和运动趋势，是更适合 action generation 的 world-change representation；
 - 如果直接使用最终层，容易让 VLA 学到教师的生成器偏差，而不是学到未来推演能力。
 
-因此，未来目标 token 由中间层动态特征压缩得到：
+当前实现不再对多层或多 horizon 特征额外执行 resampler，而是固定抓取 final positive
+conditional forward 中 zero-based denoise step 19、zero-based transformer block 20 的完整 hidden：
 
 $$
-F_t^* = R_f(\{W_t^{(\ell, \Delta)}\}_{\ell \in \mathcal{L}_f, \Delta \in \mathcal{H}})
-\in \mathbb{R}^{N_f \times d},
+F_t^* = W_t^{(20, 19, +)}
+\in \mathbb{R}^{1125 \times 3072}.
 $$
 
-其中 $\mathcal{H}$ 可以是多尺度未来窗口，例如 $\{4, 8, 16\}$ 或与 action chunk 长度解耦的固定 future index。多尺度 future 的好处是同时覆盖接触前准备、接触瞬间变化和动作结果状态。
+空间分辨率为 `480x480`，block hidden 的 1125 个 token 按 `5 x 15 x 15` 的
+temporal-height-width 顺序展平并以 BF16 保存。多尺度 future window、多层融合或 Perceiver
+resampler 仍可作为后续消融，但不属于当前 Stage 2 数据契约。
 
-学生端：
+学生端取 32 个 $F$ token hidden states，并通过独立 future mapper 展开到教师空间：
 
 $$
-\hat{F}_t = P_f(H_F).
+\hat{F}_t = P_f(\operatorname{CrossAttn}(Q_f,H_F))
+\in \mathbb{R}^{1125 \times 3072}.
 $$
 
 未来状态对齐损失为：
@@ -295,16 +310,30 @@ $$
 
 关键点是使用量化前的连续潜动作表征 $\tilde{z}^{m}_t$，而不是 VQ 后的离散 token。原因是离散 token 更适合视频生成或动作语义聚类，但会损失小位移、接触时序、速度变化等连续控制细节。VLA 的 action decoder 需要连续动作条件，因此 pre-quantization latent 更合适。
 
-将连续 motion latent 压缩成 $N_p$ 个动作规划目标 token：
+Moto 原始单个帧对输出 8 个 32 维 pre-VQ query，即 `[8,32]`。LIBERO 轨迹按 20 FPS
+解释；为覆盖与 future teacher 相同的 16-frame window，从 anchor $t$ 构造四个相邻运动段：
+
+```text
+(t+0, t+4), (t+4, t+8), (t+8, t+12), (t+12, t+16)
+```
+
+每段约 0.2 秒，完整 plan target 覆盖约 0.8 秒。episode 尾部采用
+`repeat_last_frame`，因此不会丢弃尾部 VLA 样本。四段 latent 不做均值池化或额外 resample，
+而是按 segment-major/query-major 顺序直接拼接：
 
 $$
-P_t^* = R_p(\tilde{z}^{m}_t) \in \mathbb{R}^{N_p \times d}.
+P_t^* = \operatorname{Concat}
+\left[\tilde{z}_{t:t+4}^{m},\tilde{z}_{t+4:t+8}^{m},
+\tilde{z}_{t+8:t+12}^{m},\tilde{z}_{t+12:t+16}^{m}\right]
+\in \mathbb{R}^{32 \times 32}.
 $$
 
-学生端：
+这里的第一个 `32` 是 `4 segments x 8 queries`，第二个 `32` 才是 Moto latent feature
+dimension。学生端取 32 个 $P$ token hidden states，并通过独立 plan mapper 映射到教师空间：
 
 $$
-\hat{P}_t = P_p(H_P).
+\hat{P}_t = P_p(\operatorname{CrossAttn}(Q_p,H_P))
+\in \mathbb{R}^{32 \times 32}.
 $$
 
 动作规划对齐损失为：
@@ -386,9 +415,18 @@ $$
 
 第一，空间世界模型教师。若 LingBot-World 类型模型已可用，可以直接冻结并抽取中间层特征；如果不可用，可以先使用 GeoWorld-VLM 风格的 camera-conditioned video world model 作为替代。教师输入当前图像和采样相机轨迹，输出中间层空间表征。该教师不需要理解机器人动作，只需提供视角一致的空间结构。
 
-第二，Wan / BRIDGE-WA 类型未来教师。该教师需要在具身场景数据上预训练，输入当前多视角图像、本体状态和语言指令，预测未来状态。预训练目标可以包括未来图像 latent、变化区域、motion flow 或中间视频 token。预训练完成后冻结教师，并缓存每个训练样本在多个 future horizon 上的中间层表征。
+第二，Wan / BRIDGE-WA 类型未来教师。当前固定实现为 Wan2.2-TI2V-5B：在 LIBERO 17 帧窗口上适配后冻结，对每个 stride-8 anchor 从当前图像和任务文本执行 20-step rollout，并缓存 block 20 / step 19 / positive branch hidden。每个 episode 写一个 safetensors，包含 `features[A,1125,3072]` BF16 和 `anchor_frames[A]` int64；anchor 必须严格等于 `arange(0, episode_length, 8)`。四个 suite 共 1693 episodes、34918 anchors，每个 anchor 的裸 feature 为 6,912,000 bytes，全量 cache 预计约 224.8 GiB。
 
-第三，Moto / IDM 类型潜动作教师。该教师需要在机器人视频或演示轨迹上预训练，输入当前和未来观测，学习压缩状态转移的连续 motion/action latent。对 VLA student 训练时，取量化前连续 latent 作为 $P$ token 的监督目标。
+StarVLA 启动时只为启用 alignment 的通道建立索引，并严格校验文件完整标记、suite、episode id/length、tensor key、shape、dtype、block/step/branch metadata 和 anchor 覆盖。训练取样时 feature 保持在 CPU，仅打开当前 episode 并读取 `latest anchor <= frame_index` 对应的一个切片；因此同一 future feature 最多共享给后续 8 个 VLA frame，而不会把完整 teacher cache 常驻内存。
+
+第三，Moto / IDM 类型潜动作教师。当前使用 LIBERO 训练 10 epochs 的 Moto checkpoint
+（epoch 10、step 4690，SHA256
+`4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46`）。缓存目录为
+`moto_plan_latent_pre_vq_delta4x4_h16_stride1_epoch10`；每个 episode 保存
+`features[A,32,32]` BF16 和 `anchor_frames[A]` int64，stride 为 1，anchor 严格覆盖每个 frame。
+四个 suite 共 1693 episodes、273465 anchors，实测占用 583,373,852 bytes（约 0.543 GiB）。
+loader 还会锁定 checkpoint hash、FPS、四段 offset、latent 类型、token 顺序、尾部策略和
+preprocessor，避免误用其他 Moto 版本或可视化抽样配置。
 
 所有教师都只在训练阶段使用。部署时不调用教师，也不生成视频或文本 CoT。
 
@@ -404,31 +442,60 @@ $$
 
 **Stage 2: Future rollout distillation**
 
-在 Stage 1 基础上加入 $F$ token，训练：
+Stage 2 必须通过 `INIT_CHECKPOINT` 从 Stage 1 Space2Act model checkpoint 热启动。加载器要求
+checkpoint 已包含 spatial alignment head，并完整恢复 Stage 1 的 Qwen、S token、spatial mapper
+和 ActionHead；只有 future mapper 使用当前初始化值。普通 base checkpoint、缺少 spatial head、
+包含未启用通道或参数 shape 不一致都会直接失败。
+
+本阶段插入 $S+F$ token，启用 spatial 和 future 两路 teacher alignment，关闭 $P$ token 与
+plan alignment。当前已实现的训练损失为：
 
 $$
 \mathcal{L}_{act}
 + \lambda_S\mathcal{L}_S
-+ \lambda_F\mathcal{L}_F
-+ \lambda_{SF}\mathcal{L}_{SF}.
++ \lambda_F\mathcal{L}_F.
 $$
 
-这一阶段应重点调 future horizon、教师中间层位置和 $F$ token 数量。训练初期可以固定 $S$ token projector 或使用较小学习率，避免未来教师信号破坏已学到的空间结构。
+默认配置中 $\lambda_S=\lambda_F=1.0$，暂未实现动态辅助损失调度或
+$\mathcal{L}_{SF}$。训练入口默认运行 100k optimization steps，future teacher 目录为
+`wan2_2_future_latent_h16_step20_block20z_stride8_480x480`。`token_enabled` 和
+`alignment_enabled` 仍可独立覆盖，用于 random-token、token-only 或单教师消融。
+
+三组 token bank 会从 Stage 1 起全部注册，以保证词表和 checkpoint shape 稳定。`token_count`
+可以在首次 Stage 1 训练前分别配置，但一旦生成 Stage 1 checkpoint，Stage 2/3 必须保持三个
+数值及顺序不变；现有加载逻辑不支持在课程中途安全增减 token 数。
 
 **Stage 3: Latent action planning alignment**
 
-加入 $P$ token 和潜动作教师，训练完整损失：
+Stage 3 已实现，并由 `run_space2act_train.sh` 作为默认训练阶段。该入口有两种明确语义：
+
+- `INIT_CHECKPOINT=""`：执行 cold-start 消融。Qwen 仍从 `BASE_VLM` 加载；ActionHead、S/F/P
+  typed-token embedding 和三路 alignment mapper 按当前模型构造规则初始化，不加载任何
+  StarVLA/Space2Act checkpoint。输出目录自动使用 `space2act_libero_stage3_cold_start`，避免与
+  课程训练结果混淆。
+- `INIT_CHECKPOINT` 非空：执行严格课程热启动。它必须是同时包含 spatial/future mapper 的
+  Stage 2 Space2Act checkpoint；迁移时完整恢复 Qwen、S/F token、spatial/future mapper 和
+  ActionHead，只有 plan mapper 使用 Stage 3 当前初始化值。同阶段 Stage 3 checkpoint 也可以
+  完整加载用于 restart。普通 base、Stage 1、路径不存在或 mapper 集合不匹配都会失败。
+
+空值只选择消融训练语义，不会放宽非空 checkpoint 的 shape、键集合或课程阶段校验。Stage 2
+也遵循同一规则：空值可做 cold-start 消融，非空值仍必须满足 Stage 1/2 的严格迁移契约。
+
+本阶段插入 $S+F+P$ token，启用三路 teacher alignment。当前 MVP 训练损失固定为：
 
 $$
 \mathcal{L}_{act}
 + \lambda_S\mathcal{L}_S
 + \lambda_F\mathcal{L}_F
-+ \lambda_P\mathcal{L}_P
-+ \lambda_{SF}\mathcal{L}_{SF}
-+ \lambda_{FP}\mathcal{L}_{FP}.
++ \lambda_P\mathcal{L}_P.
 $$
 
-这一阶段让 $P$ token 学习高层运动逻辑，并通过 action loss 绑定到底层连续动作。推荐在后半程加入 teacher dropout：随机丢弃某一类 teacher alignment loss，只保留 action loss 和其他 token 的监督。这可以避免 student 过度依赖某一个教师信号，也更符合推理时 teacher-free 的设置。
+默认 $\lambda_S=\lambda_F=\lambda_P=1.0$，训练预算为新的 100k optimization steps，plan
+teacher 使用上述 stride-1 `[32,32]` cache。第一版不加入 $\mathcal{L}_{SF}$、
+$\mathcal{L}_{FP}$、teacher dropout 或动态 loss schedule，避免在验证 Moto 监督价值前混入额外
+变量；这些只保留为后续消融。启动脚本默认 `SPACE2ACT_EPISODES=null` 使用全量数据，但 loader
+会在创建 dataset 时检查三类 teacher 是否覆盖所有选中 episode，因此任一缓存不完整都会在训练
+前失败。当前本机只有 episode 0/1/2 具备完整 S/F/P 三教师，可把该列表显式写入脚本做 pilot。
 
 ### 3.3 联合训练替代方案
 
@@ -448,12 +515,12 @@ late:    L_act + L_S + L_F + ramp(L_P + L_consistency)
 
 基模采用 Qwen3-VL-4B + GR00T，在 LIBERO 上完成第一阶段，再扩展到 RoboTwin。
 
-LIBERO 用于标准化比较和快速消融，建议覆盖：
+LIBERO 用于标准化比较和快速消融，当前自动评估覆盖：
 
 - LIBERO-Spatial: 检验相对空间关系、左右/前后/遮挡等能力；
 - LIBERO-Object: 检验物体识别与操作泛化；
 - LIBERO-Goal: 检验目标条件下的动作选择；
-- LIBERO-Long: 检验长程任务和未来状态推演。
+- LIBERO-10: 检验长程任务和未来状态推演。
 
 RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任务，重点选择需要精细空间关系和未来状态变化的任务，例如放入容器、打开/关闭抽屉、按按钮、绕障碍抓取、多步骤整理等。
 
@@ -466,7 +533,26 @@ RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任�
 - 初始状态与训练集不同但目标状态相同；
 - 需要先改变场景再完成目标的长程任务。
 
-### 4.2 Baselines
+### 4.2 当前 Stage 3 LIBERO 评估流程
+
+自动评估入口为
+`examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`。
+默认 `CKPT_LIST` 指向 `space2act_libero_stage3` 的 `steps_100000` checkpoint；正式运行前应确认
+或手工替换为实际产出的明确 Stage 3 checkpoint。脚本随后对 `libero_10`、
+`libero_goal`、`libero_object` 和 `libero_spatial` 创建独立任务，按 `GPU_LIST` 轮转分配 GPU，
+并从 `BASE_PORT` 起为每个任务分配独立端口。
+
+worker `eval_libero_parall_jbx.sh` 为每个任务启动 StarVLA policy server，再调用 LIBERO
+环境执行每个 task 50 trials。当前 checkpoint 配置启用了 proprio state，因此默认评估设置
+`INCLUDE_STATE=true`。视频保存到对应 run 的 `videos/<suite>/`，日志保存到
+`logs/<suite>/`。
+
+评估是严格 teacher-free 的：policy server 不接收 teacher tensor，也不会索引 LingBot/Wan/Moto
+safetensors；即使 checkpoint/config 中保留 spatial/future/plan mapper 参数，`predict_action` 路径也
+不会调用这些 alignment heads。四套件 success rate 是 checkpoint 选择的最终依据，训练 total
+loss 只作为诊断指标。
+
+### 4.3 Baselines
 
 为了证明改进不是来自“更多 token”或“更大容量”，baseline 需要包含容量控制和 teacher 类型控制。
 
@@ -489,7 +575,7 @@ RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任�
 - BRIDGE-WA final-layer target vs middle-layer target: 验证中间层动态表征优于最终重建状态；
 - Moto quantized token target vs pre-quantization continuous latent: 验证连续潜动作表征更适合控制。
 
-### 4.3 Ablation 设计
+### 4.4 Ablation 设计
 
 **Token 设计消融**
 
@@ -519,7 +605,7 @@ RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任�
 - teacher dropout 的比例；
 - 只训练 token/projector vs LoRA 微调 vs 全量微调。
 
-### 4.4 评估指标
+### 4.5 评估指标
 
 主指标：
 
@@ -549,7 +635,7 @@ RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任�
 - Counterfactual token swap: 交换不同任务的 $F$ 或 $P$ token，验证 token 是否确实携带未来/动作计划信息；
 - Attention-to-change alignment: 检查 $F \rightarrow S$ attention 是否集中于教师变化区域。
 
-### 4.5 关键假设与预期结果
+### 4.6 关键假设与预期结果
 
 **H1: 空间世界模型中间层监督优于普通视觉特征监督。**  
 预期在 LIBERO-Spatial、视角扰动和遮挡任务上，$S$ token 对齐 LingBot/GeoWorld-style 中间层会优于 DINO/VGGT/普通视觉 encoder 特征。
@@ -600,15 +686,15 @@ RoboTwin 用于检验更复杂的双臂、多物体、长程和物理交互任�
 
 ## 7. 最小可行实验路线
 
-两周 pilot 可以这样做：
+当前代码和实验状态可按以下路线继续推进：
 
-1. 复现 Qwen3-VL-4B + GR00T 在 LIBERO 上的训练和评估。
-2. 注册三类 token、使用原生 causal 排布，但先不接教师，跑 random-token baseline。
-3. 先做 $S$ token，对齐空间世界模型或 GeoWorld-style 中间层，评估 LIBERO-Spatial 与 spatial probe。
-4. 预训练或准备 Wan/BRIDGE-WA-style future teacher，缓存中间层 future features，加入 $F$ token。
-5. 预训练或准备 Moto/IDM continuous latent teacher，加入 $P$ token。
-6. 跑最小矩阵：Qwen3-VL-4B + GR00T base、random latent、$S$ only、$F$ only、$P$ only、$S+F+P$。
-7. 报告 success、latency、token masking、spatial/future/action probe，判断是否进入完整 LIBERO + RoboTwin 评估。
+1. 已完成 Qwen3-VL-4B + GR00T 的 Space2Act Stage 1 训练/推理闭环和 spatial teacher pilot。
+2. 已完成三类 token 注册、原生 causal 排布以及 token/alignment 独立开关，可运行 random-token 和 token-only baseline。
+3. 已完成 Wan2.2 future teacher 抽取协议、smoke cache 和 StarVLA Stage 2 训练/评估代码接入。
+4. 已完成 Moto epoch-10 全量 `[273465,32,32]` 等价分 episode cache，以及 Stage 3 plan loader、Stage 2 -> 3 checkpoint 迁移、训练/评估脚本和单元测试。
+5. 补齐或迁移全量 LingBot/Wan cache，并对四个 suite 做 1693-episode 三教师联合审计；当前本机联合审计只覆盖每个 suite 的 episode 0/1/2。
+6. 已用空 `INIT_CHECKPOINT` 完成 Stage 3 cold-start 的 4 卡 ZeRO-2 单步训练与保存验证；下一步从选定 Stage 2 checkpoint 启动正式 100k-step Stage 3，并对 checkpoint 序列运行四套件 teacher-free 评估，报告 success、latency、S/F/P token masking 与 action-latent probe。
+7. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 等矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout 和跨角色一致性损失。
 
 如果资源受限，优先顺序建议为：
 
@@ -642,3 +728,6 @@ Qwen3-VL-4B + GR00T baseline
 - `Latent Reasoning/PearlVLA Progressive Embodied Action-Plan Refinement in Latent Space.pdf`
 - `Latent Reasoning.docx`
 - `latent_reasoning_vla_research_plan.md`
+- `/home/jbx/Codes/DiffSynth-Studio/wan2_2_libero_future_teacher_handoff.md`
+- `/home/jbx/Codes/DiffSynth-Studio/wan2_2_libero_future_teacher_runbook.md`
+- `/home/jbx/Codes/Moto/help.txt`
