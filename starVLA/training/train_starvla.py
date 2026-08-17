@@ -267,6 +267,7 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self._adaptive_loss_accumulator = {}
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -370,6 +371,7 @@ class VLATrainer(TrainerUtils):
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
                 self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
+                self._load_adaptive_state(self.resume_from_checkpoint)
                 logger.info(
                     f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
                 )
@@ -387,6 +389,26 @@ class VLATrainer(TrainerUtils):
         else:
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
+
+    def _adaptive_state_path(self, checkpoint_path: str) -> str:
+        """Return the optional runtime-state sidecar next to a model checkpoint."""
+        for suffix in ("_pytorch_model.pt", "_model.safetensors"):
+            if checkpoint_path.endswith(suffix):
+                return checkpoint_path[: -len(suffix)] + "_adaptive.json"
+        return os.path.splitext(checkpoint_path)[0] + "_adaptive.json"
+
+    def _load_adaptive_state(self, checkpoint_path: str | None) -> None:
+        """Restore non-parameter adaptive weighting state when present."""
+        if not checkpoint_path or not hasattr(self.model, "set_adaptive_state"):
+            return
+        state_path = self._adaptive_state_path(checkpoint_path)
+        if not os.path.isfile(state_path):
+            logger.info("No adaptive weighting sidecar found; starting its state fresh")
+            return
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        self.model.set_adaptive_state(state)
+        logger.info(f"Restored adaptive weighting state from {state_path}")
 
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps."""
@@ -418,6 +440,11 @@ class VLATrainer(TrainerUtils):
                 torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+
+            adaptive_model = self.accelerator.unwrap_model(self.model)
+            if hasattr(adaptive_model, "get_adaptive_state"):
+                with open(checkpoint_path + "_adaptive.json", "w", encoding="utf-8") as handle:
+                    json.dump(adaptive_model.get_adaptive_state(), handle, indent=2, sort_keys=True)
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
@@ -547,12 +574,19 @@ class VLATrainer(TrainerUtils):
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
+            # All micro-batches in this accumulation window use the same logical
+            # optimizer step; completed_steps is incremented after this method.
+            optimizer_step = self.completed_steps + 1
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 forward_kwargs = {}
                 if str(self.config.framework.name) == "QwenSpace2ActGR00T":
                     # Progressive Space2Act 以 optimization step（而非 micro-batch）
                     # 插值教师权重；legacy 配置会收到该值但继续使用固定 loss_weight。
-                    forward_kwargs["training_step"] = self.completed_steps
+                    # The final micro-batch of an accumulation window belongs to
+                    # the step that will be logged after optimizer.step().
+                    #! 损失调度fixed模式：训练外层向模型传入训练步，实际损失权重调度过程发生在模型内部 【本质是线性插值】
+                    forward_kwargs["training_step"] = optimizer_step
                     # 梯度累积期间只在同步 micro-batch 做一次诊断，避免
                     # 同一 optimization step 重复执行 autograd.grad。
                     forward_kwargs["run_gradient_diagnostics"] = self.accelerator.sync_gradients
@@ -576,6 +610,31 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
+            #! DWA 状态更新触发。DWA 损失调度模式需要在训练主流程中主动触发
+            adaptive_model = self.accelerator.unwrap_model(self.model)
+            if getattr(adaptive_model, "dwa_enabled", False):
+                for channel in adaptive_model.dwa_channels:
+                    key = f"{channel}_alignment_loss"
+                    if key in output_dict:
+                        self._adaptive_loss_accumulator.setdefault(channel, []).append(
+                            output_dict[key].detach()
+                        )
+
+            if self.accelerator.sync_gradients and hasattr(adaptive_model, "update_adaptive_state"):
+                channel_losses = {
+                    channel: torch.stack(values).mean()
+                    for channel, values in self._adaptive_loss_accumulator.items()
+                    if values
+                }
+                adaptive_metrics = adaptive_model.update_adaptive_state(
+                    optimizer_step,
+                    channel_losses,
+                    should_update=True,
+                )
+                self._adaptive_loss_accumulator.clear()
+            else:
+                adaptive_metrics = {}
+
         metrics = {"action_dit_loss": action_loss.item(), "total_loss": total_loss.item()}
         # 自动收集框架返回的标量（如各通道 alignment loss），避免训练器
         # 为后续 future/plan 通道逐项增加硬编码日志字段。
@@ -584,6 +643,7 @@ class VLATrainer(TrainerUtils):
                 continue
             if torch.is_tensor(value) and value.numel() == 1:
                 metrics[name] = value.detach().item()
+        metrics.update(adaptive_metrics)
         return metrics
 
     def _finalize_training(self):

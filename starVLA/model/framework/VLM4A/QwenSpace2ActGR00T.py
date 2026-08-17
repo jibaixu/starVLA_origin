@@ -10,6 +10,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig, Qwen_GR00T
@@ -27,6 +28,8 @@ def _is_enabled(value) -> bool:
 def _normalize_loss_schedule(schedule_cfg, active_channels) -> tuple[tuple[int, dict[str, float]], ...]:
     """校验 progressive knots，并转换为只含 Python 标量的不可变结构。"""
     if not schedule_cfg or not _is_enabled(schedule_cfg.get("enabled", False)):
+        return ()
+    if str(schedule_cfg.get("mode", "fixed")).lower() == "dwa":
         return ()
 
     expected_channels = set(_SPACE2ACT_CHANNELS)
@@ -93,6 +96,43 @@ def _interpolate_loss_schedule(
     }
 
 
+def _normalize_dwa_config(schedule_cfg, active_channels) -> dict[str, float | int | bool]:
+    """Validate the loss-only Dynamic Weight Average configuration."""
+    mode = str(schedule_cfg.get("mode", "fixed")).lower() if schedule_cfg else "fixed"
+    if mode != "dwa":
+        return {"enabled": False, "mode": mode}
+    if not _is_enabled(schedule_cfg.get("enabled", False)):
+        raise ValueError("DWA loss_schedule requires enabled=true")
+    if not set(active_channels):
+        raise ValueError("DWA loss_schedule requires at least one alignment channel")
+    if schedule_cfg.get("knots"):
+        raise ValueError("DWA loss_schedule cannot define fixed knots")
+
+    def finite_float(name: str, default: float, minimum: float, maximum: float | None = None) -> float:
+        value = float(schedule_cfg.get(name, default))
+        if not math.isfinite(value) or value < minimum or (maximum is not None and value > maximum):
+            upper = f" and <= {maximum}" if maximum is not None else ""
+            raise ValueError(f"DWA {name} must be finite, >= {minimum}{upper}")
+        return value
+
+    interval = schedule_cfg.get("update_interval", 100)
+    if isinstance(interval, bool) or int(interval) != float(interval) or int(interval) <= 0:
+        raise ValueError("DWA update_interval must be a positive integer")
+    warmup_steps = schedule_cfg.get("warmup_steps", 5000)
+    if isinstance(warmup_steps, bool) or int(warmup_steps) != float(warmup_steps) or int(warmup_steps) < 0:
+        raise ValueError("DWA warmup_steps must be a non-negative integer")
+
+    return {
+        "enabled": True,
+        "mode": "dwa",
+        "auxiliary_budget": finite_float("auxiliary_budget", 0.30, 0.0),
+        "temperature": finite_float("temperature", 2.0, 1e-6),
+        "ema_decay": finite_float("ema_decay", 0.9, 0.0, 1.0),
+        "update_interval": int(interval),
+        "warmup_steps": int(warmup_steps),
+    }
+
+
 def _channel_defaults(token_enabled: bool, alignment_enabled: bool, target_tokens, target_dim):
     """生成三类教师通道共享的默认配置，阶段差异只由开关和目标 shape 表达。"""
     return {
@@ -118,8 +158,14 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
             "loss_schedule": {
+                "mode": "fixed",
                 "enabled": False,
                 "diagnostic_interval": 0,
+                "auxiliary_budget": 0.30,
+                "warmup_steps": 5000,
+                "temperature": 2.0,
+                "ema_decay": 0.9,
+                "update_interval": 100,
                 "knots": [],
             },
             "channels": {
@@ -182,10 +228,25 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             self.alignment_loss_weights[str(channel)] = float(channel_cfg.get("loss_weight", 1.0))
 
         schedule_cfg = latent_cfg.get("loss_schedule", {})
+        schedule_mode = str(schedule_cfg.get("mode", "fixed")).lower()
+        if schedule_mode not in ("fixed", "dwa"):
+            raise ValueError(f"Unsupported Space2Act loss_schedule mode: {schedule_mode}")
         self.loss_schedule_knots = _normalize_loss_schedule(
             schedule_cfg, self.alignment_heads.keys()
         )
         self.loss_schedule_enabled = bool(self.loss_schedule_knots)
+        self.dwa_config = _normalize_dwa_config(schedule_cfg, self.alignment_heads.keys())
+        self.dwa_enabled = bool(self.dwa_config["enabled"])
+        self.dwa_channels = tuple(self.alignment_heads.keys())
+        initial_weight = (
+            float(self.dwa_config.get("auxiliary_budget", 0.0)) / len(self.dwa_channels)
+            if self.dwa_channels
+            else 0.0
+        )
+        self.dwa_weights = {channel: initial_weight for channel in self.dwa_channels}
+        self.dwa_loss_history: dict[str, list[float]] = {channel: [] for channel in self.dwa_channels}
+        self.dwa_loss_ema: dict[str, float | None] = {channel: None for channel in self.dwa_channels}
+        self.dwa_rates: dict[str, float] = {channel: 1.0 for channel in self.dwa_channels}
         self.loss_diagnostic_interval = int(schedule_cfg.get("diagnostic_interval", 0))
         if self.loss_diagnostic_interval < 0:
             raise ValueError("loss_schedule diagnostic_interval must be non-negative")
@@ -222,11 +283,146 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         return torch.gather(hidden, dim=1, index=gather_index)
 
     def _effective_alignment_weights(self, training_step: int | None) -> dict[str, float]:
-        if not self.loss_schedule_enabled:
+        if getattr(self, "dwa_enabled", False):
+            if training_step is None:
+                raise ValueError("training_step is required when Space2Act DWA is enabled")
+            step = int(training_step)
+            if step <= int(self.dwa_config["warmup_steps"]):
+                return {channel: 0.0 for channel in self.dwa_channels}
+            return dict(self.dwa_weights)
+        if not getattr(self, "loss_schedule_enabled", False):
             return dict(self.alignment_loss_weights)
         if training_step is None:
             raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
         return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
+
+    @staticmethod
+    def _distributed_scalar(value: torch.Tensor) -> torch.Tensor:
+        """Return a detached global mean without affecting the training graph."""
+        value = value.detach().float().clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            value.div_(dist.get_world_size())
+        return value
+
+    def _update_dwa_state(
+        self,
+        training_step: int,
+        channel_losses: dict[str, torch.Tensor],
+        should_update: bool,
+    ) -> bool:
+        """Update EMA/rates once per optimizer step; return whether weights changed."""
+        if not self.dwa_enabled or not should_update:
+            return False
+        step = int(training_step)
+        warmup_steps = int(self.dwa_config["warmup_steps"])
+        if step <= warmup_steps:
+            return False
+        decay = float(self.dwa_config["ema_decay"])
+        for channel in self.dwa_channels:
+            if channel not in channel_losses:
+                continue
+            loss_value = float(self._distributed_scalar(channel_losses[channel]).item())
+            previous = self.dwa_loss_ema[channel]
+            current = loss_value if previous is None else decay * previous + (1.0 - decay) * loss_value
+            self.dwa_loss_ema[channel] = current
+            history = self.dwa_loss_history[channel]
+            history.append(current)
+            del history[:-2]
+
+        interval = int(self.dwa_config["update_interval"])
+        if (step - warmup_steps) % interval != 0:
+            return False
+
+        eps = 1e-8
+        for channel in self.dwa_channels:
+            history = self.dwa_loss_history[channel]
+            self.dwa_rates[channel] = history[-1] / max(history[-2], eps) if len(history) >= 2 else 1.0
+        rates = torch.tensor(
+            [self.dwa_rates[channel] for channel in self.dwa_channels], dtype=torch.float32
+        )
+        temperature = float(self.dwa_config["temperature"])
+        weights = torch.softmax(rates / temperature, dim=0)
+        budget = float(self.dwa_config["auxiliary_budget"])
+        self.dwa_weights = {
+            channel: float(budget * weights[index].item())
+            for index, channel in enumerate(self.dwa_channels)
+        }
+        return True
+
+    def update_adaptive_state(      #! 由外部训练主流程直接调用，然后触发 DWA 状态更新
+        self,
+        training_step: int,
+        channel_losses: dict[str, torch.Tensor],
+        should_update: bool = True,
+    ) -> dict[str, float]:
+        """Advance DWA state at an optimizer-step boundary."""
+        #! _update_dwa_state内部会进行非dwa模式拦截
+        updated = self._update_dwa_state(training_step, channel_losses, should_update)
+        metrics = {
+            "dwa_state_updated": float(updated),
+            "dwa_weight_sum": float(sum(self.dwa_weights.values())),
+            "dwa_ready": float(
+                all(len(self.dwa_loss_history[channel]) >= 2 for channel in self.dwa_channels)
+            ),
+        }
+        for channel in self.dwa_channels:
+            metrics[f"dwa_loss_ema/{channel}"] = float(self.dwa_loss_ema[channel] or 0.0)
+            metrics[f"dwa_rate/{channel}"] = float(self.dwa_rates[channel])
+            metrics[f"dwa_weight/{channel}"] = float(self.dwa_weights[channel])
+        return metrics
+
+    def get_adaptive_state(self) -> dict:
+        """Return JSON-safe non-parameter state needed to resume DWA exactly."""
+        if not self.dwa_enabled:
+            return {"mode": "fixed"}
+        return {
+            "mode": "dwa",
+            "channels": list(self.dwa_channels),
+            "weights": dict(self.dwa_weights),
+            "loss_history": {channel: list(values) for channel, values in self.dwa_loss_history.items()},
+            "loss_ema": dict(self.dwa_loss_ema),
+            "rates": dict(self.dwa_rates),
+        }
+
+    def set_adaptive_state(self, state: dict | None) -> None:
+        """Restore DWA state from a checkpoint sidecar, if this run uses DWA."""
+        if not self.dwa_enabled or not state or state.get("mode") != "dwa":
+            return
+        if tuple(state.get("channels", ())) != self.dwa_channels:
+            raise ValueError("DWA checkpoint channels do not match the current model")
+        for channel in self.dwa_channels:
+            history = [float(value) for value in state.get("loss_history", {}).get(channel, [])]
+            if len(history) > 2 or any(not math.isfinite(value) or value < 0.0 for value in history):
+                raise ValueError(f"Invalid DWA loss history for channel '{channel}'")
+            self.dwa_loss_history[channel] = history
+            ema = state.get("loss_ema", {}).get(channel, None)
+            self.dwa_loss_ema[channel] = None if ema is None else float(ema)
+            self.dwa_rates[channel] = float(state.get("rates", {}).get(channel, 1.0))
+            self.dwa_weights[channel] = float(state.get("weights", {}).get(channel, self.dwa_weights[channel]))
+        budget = float(self.dwa_config["auxiliary_budget"])
+        if any(weight < 0.0 or not math.isfinite(weight) for weight in self.dwa_weights.values()):
+            raise ValueError("Invalid DWA weights in checkpoint")
+        if not math.isclose(sum(self.dwa_weights.values()), budget, rel_tol=1e-5, abs_tol=1e-7):
+            raise ValueError("DWA checkpoint weights do not preserve auxiliary_budget")
+
+    def _dwa_metrics(self, reference: torch.Tensor, updated: bool) -> dict[str, torch.Tensor]:
+        metrics = {
+            "dwa_state_updated": reference.new_tensor(float(updated), dtype=torch.float32),
+            "dwa_weight_sum": reference.new_tensor(sum(self.dwa_weights.values()), dtype=torch.float32),
+            "dwa_ready": reference.new_tensor(
+                float(all(len(self.dwa_loss_history[channel]) >= 2 for channel in self.dwa_channels)),
+                dtype=torch.float32,
+            ),
+        }
+        for channel in self.dwa_channels:
+            metrics[f"dwa_loss_ema/{channel}"] = reference.new_tensor(
+                self.dwa_loss_ema[channel] if self.dwa_loss_ema[channel] is not None else 0.0,
+                dtype=torch.float32,
+            )
+            metrics[f"dwa_rate/{channel}"] = reference.new_tensor(self.dwa_rates[channel], dtype=torch.float32)
+            metrics[f"dwa_weight/{channel}"] = reference.new_tensor(self.dwa_weights[channel], dtype=torch.float32)
+        return metrics
 
     def _compute_gradient_diagnostics(
         self,
@@ -307,7 +503,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             losses[f"{channel}_alignment_weight"] = last_hidden.new_tensor(
                 weight, dtype=torch.float32
             )
-            active = not self.loss_schedule_enabled or weight > 0.0
+            active = not (self.loss_schedule_enabled or self.dwa_enabled) or weight > 0.0
             losses[f"{channel}_alignment_active"] = last_hidden.new_tensor(
                 float(active), dtype=torch.float32
             )
@@ -354,12 +550,15 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                 action_hidden, action_target, state_repeated, encoder_attention_mask=action_mask
             )
 
-        if self.loss_schedule_enabled:
-            steps = [step for step, _ in self.loss_schedule_knots]
-            segment = max(0, min(bisect_right(steps, int(training_step)) - 1, len(steps) - 1))
-            losses["loss_schedule_segment"] = last_hidden.new_tensor(
-                float(segment), dtype=torch.float32
-            )
+        if self.loss_schedule_enabled or self.dwa_enabled:
+            if self.dwa_enabled:
+                losses.update(self._dwa_metrics(last_hidden, False))
+            if self.loss_schedule_enabled:
+                steps = [step for step, _ in self.loss_schedule_knots]
+                segment = max(0, min(bisect_right(steps, int(training_step)) - 1, len(steps) - 1))
+                losses["loss_schedule_segment"] = last_hidden.new_tensor(
+                    float(segment), dtype=torch.float32
+                )
             should_diagnose = (
                 bool(run_gradient_diagnostics)
                 and self.loss_diagnostic_interval > 0

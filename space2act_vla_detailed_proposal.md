@@ -25,6 +25,7 @@ hidden sequence；GR00T ActionHead 以该完整序列作为 cross-attention KV�
 - `examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
@@ -520,6 +521,13 @@ loss 的课程变化，action loss 始终以 1.0 权重训练，旧教师也以�
 从一份膨胀为三份。权重为零的 mapper 跳过计算，但对应 typed token 仍通过 action loss 更新。
 每 1000 步额外记录各有效辅助目标相对 Qwen 最后一层 hidden 的加权梯度范数，以及其在对应
 typed-token 位置与 action 梯度的 cosine。第一版只做诊断，不自动应用 GradNorm/PCGrad。
+
+独立入口 `run_space2act_dwa_train.sh` 提供 `loss_schedule.mode=dwa` 自适应权重消融：前 5k 个 optimizer step
+只训练 action loss，之后在固定的 0.30 auxiliary budget 内，对 S/F/P 的 EMA loss ratio
+按 temperature-softmax 每 100 步更新权重。DWA 的 EMA、最近两次 loss history、ratio 和当前
+权重写入每个 checkpoint 旁的 `steps_N_adaptive.json`，恢复训练时一并加载。DWA 与 fixed
+knots 互斥；progressive 入口只运行 fixed knots 调度。PCGrad/GradNorm 暂不自动
+介入，只有梯度诊断显示稳定且显著的通道冲突时才进入后续消融。
 
 已有 $\lambda_S=1.0$ 的 Stage 1 在 80k 获得最佳 LIBERO rollout success，它保留为 strong-S
 legacy 对照。它不作为 progressive 主实验起点，因为其序列结构、loss 历史和已消耗步数与新的

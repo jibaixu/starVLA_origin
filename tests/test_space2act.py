@@ -22,6 +22,7 @@ from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
 from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
 from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
     QwenSpace2Act_GR00T,
+    _normalize_dwa_config,
     _interpolate_loss_schedule,
     _normalize_loss_schedule,
 )
@@ -371,6 +372,78 @@ class Space2ActTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "training_step is required"):
             QwenSpace2Act_GR00T._effective_alignment_weights(framework, None)
+
+    def test_dwa_warmup_and_weight_budget(self):
+        """DWA uses a zero auxiliary budget during warmup and preserves the budget after it."""
+        config = _normalize_dwa_config(
+            {
+                "mode": "dwa",
+                "enabled": True,
+                "auxiliary_budget": 0.3,
+                "warmup_steps": 2,
+                "update_interval": 1,
+                "temperature": 1.0,
+                "ema_decay": 0.0,
+            },
+            {"spatial", "future", "plan"},
+        )
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.dwa_enabled = True
+        framework.dwa_config = config
+        framework.dwa_channels = ("spatial", "future", "plan")
+        framework.dwa_weights = {channel: 0.1 for channel in framework.dwa_channels}
+        framework.dwa_loss_history = {channel: [] for channel in framework.dwa_channels}
+        framework.dwa_loss_ema = {channel: None for channel in framework.dwa_channels}
+        framework.dwa_rates = {channel: 1.0 for channel in framework.dwa_channels}
+
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 2),
+            {channel: 0.0 for channel in framework.dwa_channels},
+        )
+        losses = {channel: torch.tensor(value) for channel, value in {
+            "spatial": 1.0, "future": 2.0, "plan": 3.0
+        }.items()}
+        QwenSpace2Act_GR00T.update_adaptive_state(framework, 2, losses)
+        QwenSpace2Act_GR00T.update_adaptive_state(framework, 3, losses)
+        next_losses = {channel: torch.tensor(value) for channel, value in {
+            "spatial": 0.5, "future": 1.5, "plan": 3.0
+        }.items()}
+        QwenSpace2Act_GR00T.update_adaptive_state(framework, 4, next_losses)
+        self.assertAlmostEqual(sum(framework.dwa_weights.values()), 0.3, places=6)
+        self.assertGreater(framework.dwa_weights["plan"], framework.dwa_weights["spatial"])
+
+        with self.assertRaisesRegex(ValueError, "cannot define fixed knots"):
+            _normalize_dwa_config(
+                {"mode": "dwa", "enabled": True, "knots": [{"step": 0}]},
+                {"spatial"},
+            )
+
+    def test_dwa_state_round_trip(self):
+        """DWA runtime state is JSON-safe and restores its weights and history."""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.dwa_enabled = True
+        framework.dwa_config = _normalize_dwa_config(
+            {"mode": "dwa", "enabled": True, "auxiliary_budget": 0.3},
+            {"spatial", "future"},
+        )
+        framework.dwa_channels = ("spatial", "future")
+        framework.dwa_weights = {"spatial": 0.11, "future": 0.19}
+        framework.dwa_loss_history = {"spatial": [0.4, 0.3], "future": [0.8, 0.7]}
+        framework.dwa_loss_ema = {"spatial": 0.3, "future": 0.7}
+        framework.dwa_rates = {"spatial": 0.75, "future": 0.875}
+        state = QwenSpace2Act_GR00T.get_adaptive_state(framework)
+
+        restored = object.__new__(QwenSpace2Act_GR00T)
+        restored.dwa_enabled = True
+        restored.dwa_config = framework.dwa_config
+        restored.dwa_channels = framework.dwa_channels
+        restored.dwa_weights = {channel: 0.15 for channel in restored.dwa_channels}
+        restored.dwa_loss_history = {channel: [] for channel in restored.dwa_channels}
+        restored.dwa_loss_ema = {channel: None for channel in restored.dwa_channels}
+        restored.dwa_rates = {channel: 1.0 for channel in restored.dwa_channels}
+        QwenSpace2Act_GR00T.set_adaptive_state(restored, state)
+        self.assertEqual(restored.dwa_loss_history, framework.dwa_loss_history)
+        self.assertEqual(restored.dwa_weights, framework.dwa_weights)
 
     def test_hidden_gradient_diagnostics_do_not_accumulate_parameter_grads(self):
         """诊断使用 autograd.grad 读取 hidden 梯度，不应提前写入正常 backward 梯度。"""
@@ -739,8 +812,12 @@ class Space2ActTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--framework.latent_reasoning.stage 3", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.mode fixed", result.stdout)
         self.assertIn("--framework.latent_reasoning.loss_schedule.enabled true", result.stdout)
         self.assertIn("--framework.latent_reasoning.loss_schedule.diagnostic_interval 1000", result.stdout)
+        self.assertNotIn("dwa", source.lower())
+        self.assertNotIn("LOSS_DWA", source)
+        self.assertNotIn("--framework.latent_reasoning.loss_schedule.knots", result.stdout)
         for channel in ("spatial", "future", "plan"):
             self.assertIn(
                 f"--framework.latent_reasoning.channels.{channel}.token_enabled true",
@@ -755,11 +832,42 @@ class Space2ActTest(unittest.TestCase):
         self.assertNotIn("--trainer.pretrained_checkpoint", result.stdout)
 
         trainer_source = (repo_root / "starVLA/training/train_starvla.py").read_text()
-        self.assertIn('forward_kwargs["training_step"] = self.completed_steps', trainer_source)
+        self.assertIn('forward_kwargs["training_step"] = optimizer_step', trainer_source)
         self.assertIn(
             'forward_kwargs["run_gradient_diagnostics"] = self.accelerator.sync_gradients',
             trainer_source,
         )
+
+    def test_dwa_training_shell_has_dedicated_contract(self):
+        """DWA 入口应固定启用自适应模式，并与 progressive knots 完全解耦。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        path = repo_root / "examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh"
+        source = path.read_text()
+        dry_run_source = source.replace('DRY_RUN="0"', 'DRY_RUN="1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "dwa.sh"
+            script.write_text(dry_run_source)
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.mode dwa", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.enabled true", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.knots \\[\\]", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.warmup_steps 5000", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.update_interval 100", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.temperature 2.0", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.ema_decay 0.9", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.auxiliary_budget 0.30", result.stdout)
+        self.assertIn("--run_id space2act_libero_dwa_sfp_100k", result.stdout)
+        self.assertNotIn("LOSS_SCHEDULE_MODE", source)
+        self.assertNotIn("progressive_sfp", source)
 
     @staticmethod
     def _debug_option(argv: list[str], name: str) -> str:
