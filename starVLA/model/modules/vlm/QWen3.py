@@ -82,9 +82,16 @@ class _QWen3_VL_Interface(nn.Module):
         # 只控制本轮实验实际插入哪些 bank，二者分离便于阶段扩展和 checkpoint 兼容。
         self.space2act_token_ids: dict[str, list[int]] = {}
         self.space2act_active_channels: set[str] = set()
+        self.space2act_action_token_ids: list[int] = []
+        self._space2act_action_token_text = ""
 
-    def configure_space2act_tokens(self, channel_configs, init_strategy: str = "avg") -> None:
-        """注册 S/F/P token bank，扩展 Qwen 词表，并记录当前阶段启用的通道。"""
+    def configure_space2act_tokens(
+        self,
+        channel_configs,
+        init_strategy: str = "avg",
+        action_token_count: int = 0,
+    ) -> None:
+        """注册 S/F/P 与可选 A token bank，并记录当前阶段启用的通道。"""
         # 即使 Stage 1 只启用 spatial，也一次性注册三类 token。这样后续 Stage 2/3
         # 切换通道时词表大小和 token id 保持稳定，已有 checkpoint 可以直接续训。
         channel_prefixes = {"spatial": "s", "future": "f", "plan": "p"}
@@ -96,6 +103,12 @@ class _QWen3_VL_Interface(nn.Module):
             tokens = [f"<|space2act_{prefix}_{index:03d}|>" for index in range(token_count)]
             tokens_by_channel[channel] = tokens
             all_tokens.extend(tokens)
+        if action_token_count < 0:
+            raise ValueError("action_token_count must be non-negative")
+        action_tokens = [
+            f"<|space2act_a_{index:03d}|>" for index in range(int(action_token_count))
+        ]
+        all_tokens.extend(action_tokens)
 
         # tokenizer 与模型 embedding 必须同步扩容。只把词表中真正不存在的 token
         # 记为 new token，避免恢复 Space2Act checkpoint 时重复初始化已有向量。
@@ -148,6 +161,10 @@ class _QWen3_VL_Interface(nn.Module):
         self._space2act_token_text = {
             channel: "".join(tokens) for channel, tokens in tokens_by_channel.items()
         }
+        self.space2act_action_token_ids = [
+            int(tokenizer.convert_tokens_to_ids(token)) for token in action_tokens
+        ]
+        self._space2act_action_token_text = "".join(action_tokens)
         # token_enabled 只决定 forward 中是否插入，不影响已经注册的完整词表。
         self.space2act_active_channels = {
             channel
@@ -215,6 +232,10 @@ class _QWen3_VL_Interface(nn.Module):
             for channel in ("future", "plan"):
                 if channel in self.space2act_active_channels:
                     content.append({"type": "text", "text": self._space2act_token_text[channel]})
+            # A tokens 位于全部 reasoning token 之后，用同一次 causal forward 汇聚
+            # action intent；它们不属于教师通道，也不建立 alignment target。
+            if self.space2act_action_token_ids:
+                content.append({"type": "text", "text": self._space2act_action_token_text})
             msg = [{"role": "user", "content": content}]
 
             if solutions is not None:

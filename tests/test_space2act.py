@@ -19,7 +19,10 @@ from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
     EpisodeTeacherStore,
     TeacherChannelSpec,
 )
-from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
+from starVLA.model.modules.latent_reasoning import (
+    ActionGuidedEvidenceRouter,
+    CrossAttentionLatentAligner,
+)
 from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
     QwenSpace2Act_GR00T,
     _normalize_dwa_config,
@@ -286,6 +289,92 @@ class Space2ActTest(unittest.TestCase):
         aligner = CrossAttentionLatentAligner(8, 7, 6, alignment_dim=8, num_heads=2)
         with self.assertRaisesRegex(ValueError, "Expected teacher shape"):
             aligner.compute_loss(torch.randn(1, 4, 8), [torch.randn(6, 6)])
+
+    def test_action_guided_router_shapes_metrics_and_gradients(self):
+        """AISER 应为每个 A token 生成三路 slot，并保持 action/state/channel 可训练。"""
+        torch.manual_seed(7)
+        router = ActionGuidedEvidenceRouter(
+            hidden_dim=16,
+            state_dim=6,
+            action_token_count=4,
+            router_dim=8,
+            num_heads=2,
+        )
+        action_hidden = torch.randn(2, 4, 16, requires_grad=True)
+        channel_hidden = {
+            channel: torch.randn(2, 5, 16, requires_grad=True)
+            for channel in ("spatial", "future", "plan")
+        }
+        state = torch.randn(2, 3, 6, requires_grad=True)
+
+        slots, stats = router(action_hidden, channel_hidden, state)
+        self.assertEqual(slots.shape, (2, 12, 16))
+        self.assertFalse(
+            {"budget_loss", "entropy_loss", "diversity_loss"} - set(stats)
+        )
+        for channel in ("spatial", "future", "plan"):
+            self.assertIn(f"gate_mean/{channel}", stats)
+            self.assertGreaterEqual(stats[f"gate_mean/{channel}"].item(), 0.0)
+            self.assertLessEqual(stats[f"gate_mean/{channel}"].item(), 1.0)
+
+        objective = slots.square().mean()
+        objective = objective + stats["budget_loss"] + stats["entropy_loss"]
+        objective = objective + stats["diversity_loss"]
+        objective.backward()
+        self.assertIsNotNone(action_hidden.grad)
+        self.assertIsNotNone(state.grad)
+        self.assertTrue(all(hidden.grad is not None for hidden in channel_hidden.values()))
+
+    def test_action_context_replaces_typed_and_action_tokens_with_slots(self):
+        """主 AISER 路径必须屏蔽原始 S/F/P/A，并只追加 routed evidence。"""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.evidence_routing_enabled = True
+        framework.replace_routed_typed_tokens = True
+        framework.evidence_router_loss_weights = {
+            "budget_loss": 0.1,
+            "entropy_loss": 0.2,
+            "diversity_loss": 0.3,
+        }
+        framework.qwen_vl_interface = SimpleNamespace(
+            space2act_token_ids={
+                "spatial": [10, 11],
+                "future": [20],
+                "plan": [30],
+            },
+            space2act_action_token_ids=[40, 41],
+        )
+
+        class FakeRouter:
+            def __call__(self, action_hidden, channel_hidden, state=None):
+                self.action_hidden = action_hidden
+                self.channel_hidden = channel_hidden
+                self.state = state
+                slots = action_hidden.new_ones(action_hidden.shape[0], 6, action_hidden.shape[-1])
+                scalar = action_hidden.float().sum() * 0.0
+                return slots, {
+                    "budget_loss": scalar + 1.0,
+                    "entropy_loss": scalar + 2.0,
+                    "diversity_loss": scalar + 3.0,
+                    "gate_mean/spatial": scalar.detach() + 0.5,
+                }
+
+        framework.evidence_router = FakeRouter()
+        input_ids = torch.tensor([[1, 10, 11, 2, 20, 30, 40, 41, 0]])
+        hidden = torch.randn(1, 9, 8)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+        state = torch.randn(1, 1, 6)
+        routed, routed_mask, metrics = QwenSpace2Act_GR00T._build_action_context(
+            framework, input_ids, hidden, mask, state
+        )
+
+        self.assertEqual(routed.shape, (1, 15, 8))
+        self.assertTrue(torch.equal(routed[:, :9], hidden))
+        self.assertEqual(
+            routed_mask[0].tolist(),
+            [True, False, False, True, False, False, False, False, False] + [True] * 6,
+        )
+        self.assertAlmostEqual(metrics["evidence_router/auxiliary_loss"].item(), 1.4, places=6)
+        self.assertIs(framework.evidence_router.state, state)
 
     def test_progressive_schedule_interpolates_fixed_auxiliary_budget(self):
         """Progressive knots 应平滑交叉渐变，并在 warmup 后保持 0.30 总预算。"""
@@ -620,6 +709,80 @@ class Space2ActTest(unittest.TestCase):
         for key in current:
             self.assertTrue(torch.equal(adapted[key], checkpoint[key]))
 
+    def test_stage3_legacy_checkpoint_bootstraps_complete_evidence_router(self):
+        """完整 pre-AISER Stage 3 checkpoint 应保留旧权重并初始化整个 Router。"""
+        current = {
+            "backbone.weight": torch.tensor([1.0]),
+            "alignment_heads.spatial.weight": torch.tensor([2.0]),
+            "alignment_heads.future.weight": torch.tensor([3.0]),
+            "alignment_heads.plan.weight": torch.tensor([4.0]),
+            "evidence_router.query.weight": torch.tensor([5.0]),
+            "evidence_router.gate.weight": torch.tensor([6.0]),
+        }
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+            space2act_action_token_ids = [7, 8]
+
+        class FakeFramework:
+            space2act_stage = 3
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object(), "plan": object()}
+
+            def state_dict(self):
+                return current
+
+        checkpoint = {
+            key: value + 10
+            for key, value in current.items()
+            if not key.startswith("evidence_router.")
+        }
+        adapted = QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(FakeFramework(), checkpoint)
+        self.assertTrue(torch.equal(adapted["backbone.weight"], checkpoint["backbone.weight"]))
+        self.assertTrue(
+            torch.equal(
+                adapted["evidence_router.query.weight"],
+                current["evidence_router.query.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                adapted["evidence_router.gate.weight"],
+                current["evidence_router.gate.weight"],
+            )
+        )
+
+    def test_stage3_rejects_partial_evidence_router_checkpoint(self):
+        """AISER resume 缺少任意 Router 参数都不得静默重置。"""
+        current = {
+            "backbone.weight": torch.tensor([1.0]),
+            "alignment_heads.spatial.weight": torch.tensor([2.0]),
+            "alignment_heads.future.weight": torch.tensor([3.0]),
+            "alignment_heads.plan.weight": torch.tensor([4.0]),
+            "evidence_router.query.weight": torch.tensor([5.0]),
+            "evidence_router.gate.weight": torch.tensor([6.0]),
+        }
+
+        class TokenInterface:
+            space2act_token_ids = {"spatial": [], "future": [], "plan": []}
+            space2act_action_token_ids = [7, 8]
+
+        class FakeFramework:
+            space2act_stage = 3
+            qwen_vl_interface = TokenInterface()
+            alignment_heads = {"spatial": object(), "future": object(), "plan": object()}
+
+            def state_dict(self):
+                return current
+
+        checkpoint = {
+            key: value + 10
+            for key, value in current.items()
+            if key != "evidence_router.gate.weight"
+        }
+        with self.assertRaisesRegex(ValueError, "partial or incompatible evidence router"):
+            QwenSpace2Act_GR00T.adapt_checkpoint_state_dict(FakeFramework(), checkpoint)
+
     def test_stage3_rejects_stage1_checkpoint(self):
         """Stage 3 不允许跳过 future 课程，直接从只有 spatial mapper 的 Stage 1 启动。"""
 
@@ -656,6 +819,10 @@ class Space2ActTest(unittest.TestCase):
             / "examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml"
         )
         cfg = OmegaConf.load(config_path)
+        routing = cfg.framework.latent_reasoning.evidence_routing
+        self.assertFalse(routing.enabled)
+        self.assertEqual((routing.action_token_count, routing.router_dim, routing.num_heads), (8, 512, 8))
+        self.assertTrue(routing.replace_typed_tokens)
         future = cfg.framework.latent_reasoning.channels.future
         teacher = cfg.datasets.vla_data.teacher_latents.channels.future
         self.assertEqual((future.target_tokens, future.target_dim), (1125, 3072))
@@ -698,6 +865,8 @@ class Space2ActTest(unittest.TestCase):
 
         train_text = shell_paths[0].read_text()
         self.assertIn('SPACE2ACT_STAGE="3"', train_text)
+        self.assertIn('EVIDENCE_ROUTING_ENABLED="false"', train_text)
+        self.assertIn("latent_reasoning.evidence_routing.enabled", train_text)
         self.assertIn('INIT_CHECKPOINT=""', train_text)
         self.assertIn('RUN_ID="space2act_libero_stage${SPACE2ACT_STAGE}_cold_start"', train_text)
         self.assertIn('stage_tokens="spatial,future,plan"', train_text)
@@ -868,6 +1037,49 @@ class Space2ActTest(unittest.TestCase):
         self.assertIn("--run_id space2act_libero_dwa_sfp_100k", result.stdout)
         self.assertNotIn("LOSS_SCHEDULE_MODE", source)
         self.assertNotIn("progressive_sfp", source)
+
+    def test_evidence_routing_shell_enables_only_aiser_experiment(self):
+        """AISER 入口应关闭 loss schedule，并固定启用三通道路由所需契约。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        path = (
+            repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_space2act_evidence_routing_train.sh"
+        )
+        source = path.read_text()
+        dry_run_source = source.replace('DRY_RUN="0"', 'DRY_RUN="1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "evidence_routing.sh"
+            script.write_text(dry_run_source)
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--framework.latent_reasoning.stage 3", result.stdout)
+        self.assertIn("--framework.latent_reasoning.evidence_routing.enabled true", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.mode fixed", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.enabled false", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.diagnostic_interval 0", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.knots \\[\\]", result.stdout)
+        for channel in ("spatial", "future", "plan"):
+            self.assertIn(
+                f"--framework.latent_reasoning.channels.{channel}.token_enabled true",
+                result.stdout,
+            )
+            self.assertIn(
+                f"--framework.latent_reasoning.channels.{channel}.alignment_enabled true",
+                result.stdout,
+            )
+        self.assertIn("--trainer.max_train_steps 100000", result.stdout)
+        self.assertIn("--run_id space2act_libero_evidence_routing_sfp_100k", result.stdout)
+        self.assertNotIn("--trainer.pretrained_checkpoint", result.stdout)
+        self.assertNotIn("loss_schedule.mode dwa", source)
+        self.assertNotIn("loss_schedule.enabled true", source)
 
     @staticmethod
     def _debug_option(argv: list[str], name: str) -> str:

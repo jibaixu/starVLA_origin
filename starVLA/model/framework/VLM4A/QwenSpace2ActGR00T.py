@@ -12,10 +12,15 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig, Qwen_GR00T
-from starVLA.model.modules.latent_reasoning import CrossAttentionLatentAligner
+from starVLA.model.modules.latent_reasoning import (
+    ActionGuidedEvidenceRouter,
+    CrossAttentionLatentAligner,
+)
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
 _SPACE2ACT_CHANNELS = ("spatial", "future", "plan")
@@ -157,6 +162,17 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "routing_mode": "native_causal",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
+            "evidence_routing": {
+                "enabled": False,
+                "action_token_count": 8,
+                "router_dim": 512,
+                "num_heads": 8,
+                "gate_temperature": 1.0,
+                "replace_typed_tokens": True,
+                "budget_loss_weight": 0.001,
+                "entropy_loss_weight": 0.0001,
+                "diversity_loss_weight": 0.001,
+            },
             "loss_schedule": {
                 "mode": "fixed",
                 "enabled": False,
@@ -194,11 +210,58 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if latent_cfg.routing_mode != "native_causal":
             raise ValueError("The first Space2Act implementation only supports routing_mode=native_causal")
 
+        routing_cfg = latent_cfg.get("evidence_routing", {})
+        self.evidence_routing_enabled = _is_enabled(routing_cfg.get("enabled", False))
+        self.evidence_router = None
+        action_token_count = 0
+        if self.evidence_routing_enabled:
+            if self.space2act_stage != 3:
+                raise ValueError("Space2Act evidence routing is only supported in Stage 3")
+            disabled_channels = [
+                channel
+                for channel in _SPACE2ACT_CHANNELS
+                if not _is_enabled(latent_cfg.channels[channel].get("token_enabled", False))
+            ]
+            if disabled_channels:
+                raise ValueError(
+                    "Space2Act evidence routing requires all S/F/P token banks; disabled="
+                    f"{disabled_channels}"
+                )
+            action_token_count = int(routing_cfg.get("action_token_count", 8))
+            if action_token_count <= 0:
+                raise ValueError("evidence_routing action_token_count must be positive")
+
         # 先扩展 tokenizer/model embedding，再根据启用通道创建训练期 alignment head。
         self.qwen_vl_interface.configure_space2act_tokens(
-            latent_cfg.channels, init_strategy=str(latent_cfg.token_init_strategy)
+            latent_cfg.channels,
+            init_strategy=str(latent_cfg.token_init_strategy),
+            action_token_count=action_token_count,
         )
         hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
+        self.evidence_router_loss_weights = {}
+        self.replace_routed_typed_tokens = True
+        if self.evidence_routing_enabled:
+            weight_keys = {
+                "budget_loss": "budget_loss_weight",
+                "entropy_loss": "entropy_loss_weight",
+                "diversity_loss": "diversity_loss_weight",
+            }
+            for loss_name, config_name in weight_keys.items():
+                weight = float(routing_cfg.get(config_name, 0.0))
+                if not math.isfinite(weight) or weight < 0.0:
+                    raise ValueError(f"evidence_routing {config_name} must be finite and non-negative")
+                self.evidence_router_loss_weights[loss_name] = weight
+            self.replace_routed_typed_tokens = _is_enabled(
+                routing_cfg.get("replace_typed_tokens", True)
+            )
+            self.evidence_router = ActionGuidedEvidenceRouter(
+                hidden_dim=hidden_dim,
+                state_dim=int(self.config.framework.action_model.get("state_dim", 0)),
+                action_token_count=action_token_count,
+                router_dim=int(routing_cfg.get("router_dim", 512)),
+                num_heads=int(routing_cfg.get("num_heads", 8)),
+                gate_temperature=float(routing_cfg.get("gate_temperature", 1.0)),
+            )
         self.alignment_heads = nn.ModuleDict()
         self.alignment_loss_weights: dict[str, float] = {}
         for channel, channel_cfg in latent_cfg.channels.items():
@@ -251,9 +314,11 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if self.loss_diagnostic_interval < 0:
             raise ValueError("loss_schedule diagnostic_interval must be non-negative")
 
-    def _typed_positions(self, input_ids: torch.Tensor, channel: str) -> torch.Tensor:
-        """返回每个样本中指定 typed token 的位置，形状为 [B,K_channel]。"""
-        token_ids = self.qwen_vl_interface.space2act_token_ids[channel]
+    @staticmethod
+    def _token_positions(
+        input_ids: torch.Tensor, token_ids: list[int], label: str
+    ) -> torch.Tensor:
+        """Return the unique position of every token id in each batch row."""
         rows = []
         for batch_index in range(input_ids.shape[0]):
             positions = []
@@ -263,11 +328,19 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                 matches = torch.nonzero(input_ids[batch_index] == token_id, as_tuple=False).flatten()
                 if matches.numel() != 1:
                     raise ValueError(
-                        f"Expected exactly one '{channel}' token id {token_id}, found {matches.numel()}"
+                        f"Expected exactly one '{label}' token id {token_id}, found {matches.numel()}"
                     )
                 positions.append(matches[0])
             rows.append(torch.stack(positions))
         return torch.stack(rows)
+
+    def _typed_positions(self, input_ids: torch.Tensor, channel: str) -> torch.Tensor:
+        """返回每个样本中指定 typed token 的位置，形状为 [B,K_channel]。"""
+        return self._token_positions(
+            input_ids,
+            self.qwen_vl_interface.space2act_token_ids[channel],
+            channel,
+        )
 
     def _typed_hidden(
         self,
@@ -281,6 +354,77 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             positions = self._typed_positions(input_ids, channel)
         gather_index = positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1])
         return torch.gather(hidden, dim=1, index=gather_index)
+
+    def _build_action_context(
+        self,
+        input_ids: torch.Tensor,
+        last_hidden: torch.Tensor,
+        backbone_attention_mask: torch.Tensor | None,
+        state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Build the shared train/inference KV context and optional AISER losses."""
+        if not self.evidence_routing_enabled:
+            action_mask = (
+                backbone_attention_mask.to(dtype=torch.bool)
+                if backbone_attention_mask is not None
+                else None
+            )
+            return last_hidden, action_mask, {}
+
+        action_positions = self._token_positions(
+            input_ids,
+            self.qwen_vl_interface.space2act_action_token_ids,
+            "action_intent",
+        )
+        action_hidden = torch.gather(
+            last_hidden,
+            dim=1,
+            index=action_positions.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
+        )
+        channel_hidden = {}
+        channel_positions = {}
+        for channel in _SPACE2ACT_CHANNELS:
+            positions = self._typed_positions(input_ids, channel)
+            channel_positions[channel] = positions
+            channel_hidden[channel] = self._typed_hidden(
+                input_ids, last_hidden, channel, positions=positions
+            )
+
+        evidence_slots, router_stats = self.evidence_router(
+            action_hidden, channel_hidden, state=state
+        )
+        if backbone_attention_mask is None:
+            action_mask = torch.ones(
+                last_hidden.shape[:2], device=last_hidden.device, dtype=torch.bool
+            )
+        else:
+            action_mask = backbone_attention_mask.to(device=last_hidden.device, dtype=torch.bool).clone()
+
+        # A tokens are selector-only. S/F/P are also hidden in the main setting so the
+        # action head must consume their information through the routed evidence slots.
+        action_mask.scatter_(1, action_positions, False)
+        if self.replace_routed_typed_tokens:
+            for positions in channel_positions.values():
+                action_mask.scatter_(1, positions, False)
+        slot_mask = torch.ones(
+            evidence_slots.shape[:2], device=action_mask.device, dtype=torch.bool
+        )
+        routed_hidden = torch.cat((last_hidden, evidence_slots), dim=1)
+        routed_mask = torch.cat((action_mask, slot_mask), dim=1)
+
+        metrics = {}
+        auxiliary_loss = last_hidden.new_zeros((), dtype=torch.float32)
+        for loss_name in ("budget_loss", "entropy_loss", "diversity_loss"):
+            loss = router_stats[loss_name]
+            weight = self.evidence_router_loss_weights[loss_name]
+            metrics[f"evidence_router/{loss_name}"] = loss
+            metrics[f"evidence_router/weighted_{loss_name}"] = weight * loss
+            auxiliary_loss = auxiliary_loss + weight * loss
+        for name, value in router_stats.items():
+            if name not in ("budget_loss", "entropy_loss", "diversity_loss"):
+                metrics[f"evidence_router/{name}"] = value
+        metrics["evidence_router/auxiliary_loss"] = auxiliary_loss
+        return routed_hidden, routed_mask, metrics
 
     def _effective_alignment_weights(self, training_step: int | None) -> dict[str, float]:
         if getattr(self, "dwa_enabled", False):
@@ -531,20 +675,37 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             channel_losses[channel] = channel_loss
             channel_positions[channel] = positions
 
-        # action 分支继续沿用 GR00T 的 repeated diffusion 训练方式；attention mask、
-        # state 和 Qwen hidden 按相同 repeats 扩展，保持 batch 维严格一致。
+        state_tensor = None
+        if state is not None:
+            state_tensor = torch.tensor(
+                np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+            )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            action_context, action_context_mask, router_metrics = self._build_action_context(
+                qwen_inputs["input_ids"],
+                last_hidden,
+                backbone_attention_mask,
+                state_tensor,
+            )
+        losses.update(router_metrics)
+        router_auxiliary_loss = router_metrics.get(
+            "evidence_router/auxiliary_loss",
+            last_hidden.new_zeros((), dtype=torch.float32),
+        )
+
+        # action 分支继续沿用 GR00T 的 repeated diffusion 训练方式；routed context、
+        # attention mask 和 state 按相同 repeats 扩展，保持 batch 维严格一致。
         with torch.autocast("cuda", dtype=torch.float32):
             action_tensor = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
             action_target = action_tensor[:, -self.action_horizon :, :]
             repeats = int(self.config.framework.action_model.get("repeated_diffusion_steps", 4))
             action_target = action_target.repeat(repeats, 1, 1)
-            action_hidden = last_hidden.repeat(repeats, 1, 1)
+            action_hidden = action_context.repeat(repeats, 1, 1)
             action_mask = None
-            if backbone_attention_mask is not None:
-                action_mask = backbone_attention_mask.repeat(repeats, 1).to(dtype=torch.bool)
+            if action_context_mask is not None:
+                action_mask = action_context_mask.repeat(repeats, 1).to(dtype=torch.bool)
             state_repeated = None
-            if state is not None:
-                state_tensor = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
+            if state_tensor is not None:
                 state_repeated = state_tensor.repeat(repeats, 1, 1)
             action_loss = self.action_model(
                 action_hidden, action_target, state_repeated, encoder_attention_mask=action_mask
@@ -582,8 +743,54 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         # trainer 优先反传 total_loss；同时保留分项，便于独立观察 action 与各教师损失。
         losses["action_loss"] = action_loss
         losses["alignment_loss"] = total_alignment_loss
-        losses["total_loss"] = action_loss + total_alignment_loss
+        losses["total_loss"] = action_loss + total_alignment_loss + router_auxiliary_loss
         return losses
+
+    @torch.inference_mode()
+    def predict_action(self, examples: List[dict], **kwargs: str) -> np.ndarray:
+        """Predict actions with the same one-shot evidence routing used for training."""
+        if type(examples) is not list:
+            examples = [examples]
+        batch_images = [to_pil_preserve(example["image"]) for example in examples]
+        instructions = [example["lang"] for example in examples]
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images, instructions=instructions
+        )
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = outputs.hidden_states[-1]
+
+        state_tensor = (
+            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
+            if state is not None
+            else None
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            action_context, action_mask, _ = self._build_action_context(
+                qwen_inputs["input_ids"],
+                last_hidden,
+                backbone_attention_mask,
+                state_tensor,
+            )
+        with torch.autocast("cuda", dtype=torch.float32):
+            pred_actions = self.action_model.predict_action(
+                action_context, state_tensor, encoder_attention_mask=action_mask
+            )
+        return {"normalized_actions": pred_actions.detach().cpu().numpy()}
 
     def adapt_checkpoint_state_dict(self, checkpoint: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """适配 base/前一阶段 checkpoint，并严格约束课程迁移与同阶段恢复。"""
@@ -598,6 +805,10 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             for token_ids in self.qwen_vl_interface.space2act_token_ids.values()
             for token_id in token_ids
         )
+        protected_token_ids.extend(
+            getattr(self.qwen_vl_interface, "space2act_action_token_ids", [])
+        )
+        protected_token_ids = sorted(set(protected_token_ids))
         for key, source in checkpoint.items():
             target = current.get(key)
             if target is None:
@@ -618,6 +829,26 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                     valid_ids = [token_id for token_id in protected_token_ids if token_id < target.shape[0]]
                     expanded[valid_ids] = target.detach().cpu()[valid_ids]
                 adapted[key] = expanded
+
+        current_router_keys = {key for key in current if key.startswith("evidence_router.")}
+        checkpoint_router_keys = {
+            key for key in checkpoint if key.startswith("evidence_router.")
+        }
+        if current_router_keys:
+            if checkpoint_router_keys and checkpoint_router_keys != current_router_keys:
+                missing_router = sorted(current_router_keys - checkpoint_router_keys)
+                unexpected_router = sorted(checkpoint_router_keys - current_router_keys)
+                raise ValueError(
+                    "Checkpoint contains a partial or incompatible evidence router: "
+                    f"missing={missing_router[:10]}, unexpected={unexpected_router[:10]}"
+                )
+            if not checkpoint_router_keys:
+                # A complete pre-AISER Space2Act checkpoint may bootstrap the router once;
+                # subsequent AISER resumes remain strict through the branch above.
+                for key in current_router_keys:
+                    adapted[key] = current[key].detach().cpu().clone()
+        elif checkpoint_router_keys:
+            raise ValueError("Cannot load an AISER checkpoint with evidence routing disabled")
 
         stage = int(getattr(self, "space2act_stage", 1))
         if stage >= 2:

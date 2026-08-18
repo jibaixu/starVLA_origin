@@ -1,29 +1,33 @@
 # Space2Act-VLA: 多世界模型教师蒸馏的三通道潜在推理方案
 
-## 实现基线与当前范围（2026-07）
+## 实现基线与当前范围（2026-08）
 
 本文档中的工程基线以仓库当前实现为准：**Qwen3-VL-4B-Instruct + GR00T
 FlowmatchingActionHead**，而不是 OpenVLA-OFT。Qwen 接收多视角图像和指令，输出完整末层
-hidden sequence；GR00T ActionHead 以该完整序列作为 cross-attention KV，并额外接收 proprio state。
+hidden sequence；legacy GR00T ActionHead 以该完整序列作为 cross-attention KV，并额外接收
+proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自适应压缩 S/F/P evidence。
 
 第一版采用以下经过显存与扩展性权衡后的设计：
 
 - 三组 S/F/P token 从 Stage 1 起全部注册到 tokenizer（默认每组 32 个），确保各阶段词表和 checkpoint shape 稳定；只有 `token_enabled` 的组被插入序列。
-- 序列沿用 Qwen 原生 causal attention，物理顺序为 `images -> S -> instruction -> F -> P`。自定义 block-wise mask 是后续消融项，不属于当前 MVP。
+- 序列沿用 Qwen 原生 causal attention；legacy 顺序为 `images -> S -> instruction -> F -> P`，AISER 开启后追加未直接接受教师监督的 A tokens，形成 `images -> S -> instruction -> F -> P -> A`。
 - 学生侧每个通道只有 32 个 compact token。训练期 mapper 使用与教师 token 数相同的 learned queries，通过 cross-attention 读取 compact hidden，再映射到教师维度；推理完全跳过 mapper。
 - Stage 1 的 LingBot 监督是 `[1521, 5120]`，mapper 为 `32 x 2560 -> 1521 x 5120`，内部维度 1024、8 heads、query chunk 128。
 - Stage 2 的 Wan2.2-TI2V-5B 监督是 `[1125, 3072]`：抓取 20-step rollout 的 final positive denoise step（zero-based step 19）、zero-based block 20 hidden，token 顺序为 `5 x 15 x 15` 的 T-H-W 展平。future mapper 为 `32 x 2560 -> 1125 x 3072`，同样使用 1024 内部维度、8 heads 和 query chunk 128。
 - Stage 3 的 Moto 监督是 `[32, 32]`：以当前 frame 为 anchor，在 16-frame future window 内构造 `0:4/4:8/8:12/12:16` 四个连续 delta-4 motion segment。每段保留 8 个、维度 32 的量化前 latent，按 segment-major 顺序拼接为 32 个目标 token。
-- 对齐损失是逐 token LayerNorm 后的 cosine + `0.1 * MSE`；总损失为 GR00T action loss 加启用通道的加权 alignment loss。
+- 对齐损失是逐 token LayerNorm 后的 cosine + `0.1 * MSE`；AISER 关闭时总损失为 GR00T action loss 加启用通道的加权 alignment loss，开启时再加入 gate budget、attention entropy 和 slot diversity 正则。
 - `token_enabled` 与 `alignment_enabled` 独立，支持同 token 数无 teacher loss 的 random-token control。
+- AISER 使用 proprio-state-conditioned A hidden 对 S/F/P 分别执行 token attention，默认生成 `3 x 8` 个连续 gated evidence slots；原始 S/F/P/A 不再直接作为 ActionHead KV。路由只使用 student hidden，推理不读取教师 tensor，并在所有 flow-matching denoising step 间复用一次结果。
 - Stage 1/2/3 的 legacy 课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。另有独立 progressive 入口：从第 0 步固定 S/F/P 序列，在单次 100k optimizer 轨迹中只调度教师权重；旧流程继续用于 checkpoint 课程和消融。
 
 对应实现入口为：
 
 - `starVLA/model/framework/VLM4A/QwenSpace2ActGR00T.py`
 - `starVLA/model/modules/latent_reasoning/space2act_alignment.py`
+- `starVLA/model/modules/latent_reasoning/action_evidence_router.py`
 - `examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_evidence_routing_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
@@ -42,7 +46,8 @@ legacy 课程实验还需填写正式 Stage 2 `INIT_CHECKPOINT`。固定序列 p
 global-step 传递和梯度诊断代码已经接入，但 100k-step progressive/legacy Stage 3 训练与四套件
 成功率结果均尚未执行。
 
-下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout 或额外 resampler 的内容，均应视为后续研究选项，而非第一版实现承诺。
+下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout、额外
+resampler 或 PCGrad 梯度干预的内容，均应视为后续研究选项，而非当前 AISER 实现承诺。
 
 ## 0. 方案定位
 
@@ -365,7 +370,50 @@ $$
 
 这会让动作规划 token 学到“这个高层运动计划应该导致什么未来变化”，避免 $P$ token 退化成 action head 的额外容量。
 
-### 2.7 动作监督与总损失
+### 2.7 Action-Intent-Guided Sparse Evidence Routing
+
+直接把全部 $H_S,H_F,H_P$ 作为 ActionHead KV，会假设每个 action chunk 在任何执行状态下都
+同等需要所有教师塑形后的 token。AISER 改为引入 $N_A=8$ 个未直接接受教师对齐的 Action
+Intent Tokens。A tokens 位于 S/F/P 之后，通过同一次 Qwen causal forward 获得 $H_A$，再与
+当前 proprioceptive state 的最后一个时间步融合：
+
+$$
+Q_A = \operatorname{LN}\left(H_A + W_q q_t\right).
+$$
+
+对每个 $c\in\{S,F,P\}$ 使用独立的 K/V、gate 和 null 参数，但保持相同计算结构：
+
+$$
+\alpha_c = \operatorname{softmax}
+\left(\frac{W_Q^c Q_A(W_K^c H_c)^\top}{\sqrt d}\right),\qquad
+E_c=\alpha_c W_V^cH_c,
+$$
+
+$$
+g_c=\sigma\left(\frac{\operatorname{MLP}_c[W_Q^cQ_A;E_c]}{\tau}\right),\qquad
+R_c=g_c\odot W_O^cE_c+(1-g_c)\odot N_c.
+$$
+
+三个通道各产生 8 个 slot，得到最多 24 个 routed evidence。$H_A$ 只生成 attention 和 gate，
+不作为 value、residual 或独立 KV 送入 ActionHead；主设置同时 mask 原始 S/F/P/A 位置，避免
+action decoder 绕过 evidence bottleneck。原始视觉、指令等非类型化 Qwen context 保留。
+
+连续 gate 表达样本相关的软预算，不使用 hard top-k。对应正则为：
+
+$$
+\mathcal{L}_{route}
+=\lambda_b\operatorname{Mean}(g)
++\lambda_e\operatorname{Entropy}(\alpha)
++\lambda_d\operatorname{OffDiagCos}(\alpha),
+$$
+
+默认 $\lambda_b=10^{-3},\lambda_e=10^{-4},\lambda_d=10^{-3}$。三个正项分别鼓励较少有效
+slot、集中的 token selection 和同通道 slot 间非冗余。Router 只读取 Qwen 的 S/F/P hidden，
+不读取 raw teacher tensor；训练 repeated diffusion 与推理 denoising loop 都复用同一份 $R$。
+独立入口 `run_space2act_evidence_routing_train.sh` 固定启用 Stage 3 S/F/P token、三路 alignment
+和 AISER，同时显式关闭 fixed progressive schedule 与 DWA，用作 direct-joint 对照之外的纯路由实验。
+
+### 2.8 动作监督与总损失
 
 当前 base 固定采用 GR00T flow-matching action head。若作为对照实验改用简单连续回归，动作损失可写为：
 
@@ -385,7 +433,8 @@ $$
 \right],
 $$
 
-其中 $c_t$ 是由 $H_V, H_L, H_S, H_F, H_P$ 构成的条件表示。
+其中 legacy $c_t$ 由 $H_V,H_L,H_S,H_F,H_P$ 构成；AISER 主设置则由非类型化 Qwen
+context 与 $R_S,R_F,R_P$ 构成。
 
 总损失为：
 
@@ -397,7 +446,8 @@ $$
 + \lambda_P \mathcal{L}_P
 + \lambda_{SF}\mathcal{L}_{SF}
 + \lambda_{FP}\mathcal{L}_{FP}
-+ \lambda_{role}\mathcal{L}_{role}.
++ \lambda_{role}\mathcal{L}_{role}
++ \mathcal{L}_{route}.
 $$
 
 $\mathcal{L}_{role}$ 用于防止三类 token 表征坍缩，可采用简单的 role disentanglement 正则：
@@ -529,6 +579,13 @@ typed-token 位置与 action 梯度的 cosine。第一版只做诊断，不自�
 knots 互斥；progressive 入口只运行 fixed knots 调度。PCGrad/GradNorm 暂不自动
 介入，只有梯度诊断显示稳定且显著的通道冲突时才进入后续消融。
 
+PCGrad 仍保留为独立研究分支，而不是被 AISER 否定。参数级 PCGrad 与 ZeRO-2 的分片梯度
+契约冲突较大，不作为首选实现；若长期日志同时出现显著负 gradient cosine 和 Action Success
+Rate 下降，可优先验证 Feature-Level PCGrad：在 Qwen 最后一层 hidden bottleneck 上获取 action
+与 alignment 梯度并执行正交投影，再向基座传播。该分支必须有独立开关，并与 AISER 做正交
+消融（none / AISER / Feature-Level PCGrad / both）；在触发条件出现前只保留设计与诊断，不接入
+当前训练默认路径。
+
 已有 $\lambda_S=1.0$ 的 Stage 1 在 80k 获得最佳 LIBERO rollout success，它保留为 strong-S
 legacy 对照。它不作为 progressive 主实验起点，因为其序列结构、loss 历史和已消耗步数与新的
 等算力 100k 设计不同。Progressive 必须保留 action-only fixed-token、direct-joint fixed-token、
@@ -630,6 +687,16 @@ loss 只作为诊断指标。
 - teacher dropout 的比例；
 - 只训练 token/projector vs LoRA 微调 vs 全量微调。
 
+**AISER 路由消融**
+
+- direct all-S/F/P KV vs AISER append vs AISER replace；
+- 去掉 state conditioning，只使用 $H_A$；
+- 去掉 gate，仅保留 action-query token attention；
+- A token / 每通道最大 slot 数扫描：4/8/16；
+- 去掉 budget、entropy、diversity 各正则；
+- 固定平均 gate vs 样本自适应 gate；
+- none / AISER / Feature-Level PCGrad / both 的正交比较（后者只在梯度冲突触发后执行）。
+
 ### 4.5 评估指标
 
 主指标：
@@ -659,6 +726,8 @@ loss 只作为诊断指标。
 - Token masking: 分别 mask $S/F/P$ token，观察 success rate 下降；
 - Counterfactual token swap: 交换不同任务的 $F$ 或 $P$ token，验证 token 是否确实携带未来/动作计划信息；
 - Attention-to-change alignment: 检查 $F \rightarrow S$ attention 是否集中于教师变化区域。
+- AISER gate/slot profile: 分任务阶段报告各通道 gate、有效 slot 数、attention entropy 与
+  Action Success Rate 的关系，检查全开、全关或 slot collapse。
 
 ### 4.6 关键假设与预期结果
 
@@ -674,10 +743,15 @@ loss 只作为诊断指标。
 **H4: 三通道组合优于任意单通道。**  
 空间 token 提供“哪里可操作”，未来 token 提供“会变成什么”，动作 token 提供“如何移动”。三者缺一时，性能提升应集中在部分任务；完整模型应在空间、长程和精细操作上都有提升。
 
-**H5: 自定义 block-wise causal routing 可能优于原生 causal routing。**  
+**H5: Action-conditioned evidence routing 优于直接读取全部 S/F/P。**
+不同 action chunk 对空间、未来和 motion evidence 的需求并不恒定。预期 AISER 在保持或降低
+action KV 长度的同时提升 success，并产生随任务阶段变化的 channel gate；若 gate 长期恒定，
+则路由只增加了容量而没有实现样本自适应选择。
+
+**H6: 自定义 block-wise causal routing 可能优于原生 causal routing。**
 当前实现以原生 Qwen causal attention 为基线。只有后续 block-wise routing 在相同 token、teacher 和训练预算下稳定更好，才能把收益归因于额外 routing 归纳偏置。
 
-**H6: teacher-free inference 能保持低延迟。**  
+**H7: teacher-free inference 能保持低延迟。**
 训练阶段读取离线教师特征并执行 mapper，但推理阶段只增加固定数量 latent token，mapper 分支完全跳过。相比需要外部 world model rollout 或显式 CoT 生成的方法，额外延迟只来自 Qwen 序列中的少量 token。
 
 ## 5. 论文贡献写法
@@ -690,12 +764,14 @@ loss 只作为诊断指标。
 **Contribution 2: Multi-world-model distillation without inference-time teachers.**  
 提出将空间探索世界模型、具身未来预测世界模型和潜动作教师的能力蒸馏进 VLA latent tokens，使模型在推理时不依赖外部 world model 或显式 CoT，也能自主形成未来状态推演。
 
-**Contribution 3: Causal latent routing from space to future to action.**  
-通过 typed token 的 causal 排布与独立训练期 expansion mapper，使空间、未来和动作计划监督能够在同一 Qwen hidden sequence 中逐阶段加入；block-wise mask 与跨角色一致性损失作为后续增强验证。
+**Contribution 3: Action-intent-guided sparse evidence routing.**
+提出由 proprio-state-conditioned Action Intent Tokens 驱动的稀疏路由，在 action decoding 前将
+teacher-supervised S/F/P hidden 转换为紧凑的 gated evidence slots，使三类教师保持对称地位，
+同时让每个 action chunk 自适应选择空间、未来与运动计划证据。
 
 一句话 novelty 可以写成：
 
-> We shift latent reasoning for VLA from language-chain imitation to world-dynamics internalization, using typed latent tokens as a teacher-free interface between spatial structure, imagined future state, and continuous motor planning.
+> We shift VLA reasoning from language-chain imitation to action-conditioned world-evidence selection: typed latent tokens internalize complementary world-model teachers, while state-conditioned action-intent queries sparsely route spatial, future, and motion evidence without inference-time teachers.
 
 ## 6. 最强质疑与回应
 
@@ -705,7 +781,7 @@ loss 只作为诊断指标。
 | 训练时使用未来帧或未来教师是否信息泄漏？ | Student 推理时只接收当前观测、指令和本体状态。未来观测只用于教师预训练或训练阶段监督，等价于 auxiliary future prediction target。实验中应明确 teacher target 是训练标签，不是 inference input。 |
 | 为什么不用世界模型在线 rollout？ | 在线 rollout 成本高、延迟大，且容易把规划能力外包给教师。本方案目标是把多个教师的能力内化为 VLA 的 latent computation，使部署时仍保持单次或近似单次前向推理。 |
 | 为什么对齐中间层而不是最终层？ | 最终层更接近图像重建，包含渲染和纹理细节；中间层更可能保留任务条件下的变化方向、接触区域和物体交互关系。该观点需要通过 final-layer vs middle-layer 消融验证。 |
-| 三个教师信号是否会冲突？ | 使用课程学习、独立 projector、loss ramp-up 和 teacher dropout 降低冲突。若冲突明显，可引入 uncertainty weighting 或只在不同训练阶段激活不同 teacher。 |
+| 三个教师信号是否会冲突？ | 使用课程学习、独立 projector、loss ramp-up 和 AISER 降低无关证据进入 action decoder 的影响。梯度诊断持续观察冲突；若显著负 cosine 与 success 下降同时出现，再独立评估 Feature-Level PCGrad，而不直接采用 ZeRO-2 不友好的参数级投影。 |
 | Moto 的 motion latent 和机器人 action 是否不完全一致？ | 本方案不把 Moto latent 当成最终动作，而是作为高层运动计划监督。最终 action 仍由 GR00T flow-matching action loss 决定，Moto 只提供连续 motion prior。 |
 | 世界模型教师可能 hallucinate future。 | 教师必须在具身轨迹上预训练，并通过 future-change probe 和 action success 验证。训练时可使用 teacher confidence、multi-horizon consistency 或真实未来帧 encoder feature 作为辅助锚点。 |
 
@@ -719,8 +795,9 @@ loss 只作为诊断指标。
 4. 已完成 Moto epoch-10 全量 `[273465,32,32]` 等价分 episode cache，以及 Stage 3 plan loader、Stage 2 -> 3 checkpoint 迁移、训练/评估脚本和单元测试。
 5. 补齐或迁移全量 LingBot/Wan cache，并对四个 suite 做 1693-episode 三教师联合审计；当前本机联合审计只覆盖每个 suite 的 episode 0/1/2。
 6. 已用空 `INIT_CHECKPOINT` 完成 legacy Stage 3 cold-start 的 4 卡 ZeRO-2 单步训练与保存验证；固定序列 progressive 入口、0.30 总辅助预算和 hidden-gradient 诊断也已实现。
-7. 分别运行 100k action-only fixed-token、direct-joint 和 progressive 三个等算力主实验，在 20k/50k/80k/100k 执行四套件 teacher-free 评估，并报告 success、S/F/P masking、alignment 与梯度冲突指标；已有 80k strong-S checkpoint 单独作为非等配方 legacy 对照。
-8. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 等矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout 和跨角色一致性损失。
+7. 已实现可选 Stage 3 AISER：A token 注册、state-conditioned 三通道路由、typed-token replacement、训练/推理共享的一次性 evidence context、辅助指标和旧 checkpoint bootstrap；下一步先做真实 ZeRO-2 单步与 teacher-free rollout smoke test。
+8. 分别运行 100k action-only fixed-token、direct-joint、progressive 和 AISER 等算力主实验，在 20k/50k/80k/100k 执行四套件 teacher-free 评估，并报告 success、S/F/P masking、gate/slot profile、alignment 与梯度冲突指标；已有 80k strong-S checkpoint 单独作为非等配方 legacy 对照。
+9. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 及 AISER 消融矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout、Feature-Level PCGrad 和跨角色一致性损失。
 
 如果资源受限，优先顺序建议为：
 
@@ -730,6 +807,7 @@ Qwen3-VL-4B + GR00T baseline
 -> S token spatial teacher
 -> S+F token future teacher
 -> full S+F+P
+-> AISER over S+F+P
 ```
 
 因为空间和未来是论文主线，Moto/IDM 的动作规划 token 是增强 novelty 和控制相关性的关键，但实现成本更高。
