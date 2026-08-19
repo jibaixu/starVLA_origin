@@ -470,7 +470,7 @@ class Space2ActTest(unittest.TestCase):
                 "enabled": True,
                 "auxiliary_budget": 0.3,
                 "warmup_steps": 2,
-                "update_interval": 1,
+                "update_interval": 2,
                 "temperature": 1.0,
                 "ema_decay": 0.0,
             },
@@ -484,6 +484,10 @@ class Space2ActTest(unittest.TestCase):
         framework.dwa_loss_history = {channel: [] for channel in framework.dwa_channels}
         framework.dwa_loss_ema = {channel: None for channel in framework.dwa_channels}
         framework.dwa_rates = {channel: 1.0 for channel in framework.dwa_channels}
+        framework.dwa_log_rates = {channel: 0.0 for channel in framework.dwa_channels}
+        framework.dwa_log_rate_initialized = {channel: False for channel in framework.dwa_channels}
+        framework.dwa_window_loss_sum = {channel: 0.0 for channel in framework.dwa_channels}
+        framework.dwa_window_steps = 0
 
         self.assertEqual(
             QwenSpace2Act_GR00T._effective_alignment_weights(framework, 2),
@@ -494,12 +498,20 @@ class Space2ActTest(unittest.TestCase):
         }.items()}
         QwenSpace2Act_GR00T.update_adaptive_state(framework, 2, losses)
         QwenSpace2Act_GR00T.update_adaptive_state(framework, 3, losses)
+        QwenSpace2Act_GR00T.update_adaptive_state(framework, 4, losses)
+        self.assertFalse(all(framework.dwa_log_rate_initialized.values()))
         next_losses = {channel: torch.tensor(value) for channel, value in {
             "spatial": 0.5, "future": 1.5, "plan": 3.0
         }.items()}
-        QwenSpace2Act_GR00T.update_adaptive_state(framework, 4, next_losses)
+        QwenSpace2Act_GR00T.update_adaptive_state(framework, 5, next_losses)
+        self.assertAlmostEqual(framework.dwa_weights["spatial"], 0.1, places=6)
+        update_metrics = QwenSpace2Act_GR00T.update_adaptive_state(framework, 6, next_losses)
+        self.assertTrue(all(framework.dwa_log_rate_initialized.values()))
+        self.assertEqual(update_metrics["dwa_state_updated"], 1.0)
         self.assertAlmostEqual(sum(framework.dwa_weights.values()), 0.3, places=6)
         self.assertGreater(framework.dwa_weights["plan"], framework.dwa_weights["spatial"])
+        self.assertGreater(framework.dwa_weights["future"], framework.dwa_weights["spatial"])
+        self.assertAlmostEqual(update_metrics["dwa_window_steps"], 0.0, places=6)
 
         with self.assertRaisesRegex(ValueError, "cannot define fixed knots"):
             _normalize_dwa_config(
@@ -520,6 +532,10 @@ class Space2ActTest(unittest.TestCase):
         framework.dwa_loss_history = {"spatial": [0.4, 0.3], "future": [0.8, 0.7]}
         framework.dwa_loss_ema = {"spatial": 0.3, "future": 0.7}
         framework.dwa_rates = {"spatial": 0.75, "future": 0.875}
+        framework.dwa_log_rates = {"spatial": -0.2876820725, "future": -0.1335313926}
+        framework.dwa_log_rate_initialized = {"spatial": True, "future": True}
+        framework.dwa_window_loss_sum = {"spatial": 0.12, "future": 0.34}
+        framework.dwa_window_steps = 17
         state = QwenSpace2Act_GR00T.get_adaptive_state(framework)
 
         restored = object.__new__(QwenSpace2Act_GR00T)
@@ -530,9 +546,16 @@ class Space2ActTest(unittest.TestCase):
         restored.dwa_loss_history = {channel: [] for channel in restored.dwa_channels}
         restored.dwa_loss_ema = {channel: None for channel in restored.dwa_channels}
         restored.dwa_rates = {channel: 1.0 for channel in restored.dwa_channels}
+        restored.dwa_log_rates = {channel: 0.0 for channel in restored.dwa_channels}
+        restored.dwa_log_rate_initialized = {channel: False for channel in restored.dwa_channels}
+        restored.dwa_window_loss_sum = {channel: 0.0 for channel in restored.dwa_channels}
+        restored.dwa_window_steps = 0
         QwenSpace2Act_GR00T.set_adaptive_state(restored, state)
         self.assertEqual(restored.dwa_loss_history, framework.dwa_loss_history)
         self.assertEqual(restored.dwa_weights, framework.dwa_weights)
+        self.assertEqual(restored.dwa_log_rate_initialized, framework.dwa_log_rate_initialized)
+        self.assertEqual(restored.dwa_window_loss_sum, framework.dwa_window_loss_sum)
+        self.assertEqual(restored.dwa_window_steps, framework.dwa_window_steps)
 
     def test_hidden_gradient_diagnostics_do_not_accumulate_parameter_grads(self):
         """诊断使用 autograd.grad 读取 hidden 梯度，不应提前写入正常 backward 梯度。"""
@@ -559,7 +582,7 @@ class Space2ActTest(unittest.TestCase):
         )
         self.assertIsNone(hidden.grad)
         self.assertTrue(all(torch.isfinite(value) for value in diagnostics.values()))
-        self.assertGreater(diagnostics["gradient_cosine/spatial_vs_action"].item(), 0.0)
+        self.assertGreater(diagnostics["gradient_cosine/spatial_vs_action"].item(), 0.99)
 
         total_loss = action_loss + sum(weights[name] * loss for name, loss in channel_losses.items())
         total_loss.backward()
@@ -1030,9 +1053,9 @@ class Space2ActTest(unittest.TestCase):
         self.assertIn("--framework.latent_reasoning.loss_schedule.enabled true", result.stdout)
         self.assertIn("--framework.latent_reasoning.loss_schedule.knots \\[\\]", result.stdout)
         self.assertIn("--framework.latent_reasoning.loss_schedule.warmup_steps 5000", result.stdout)
-        self.assertIn("--framework.latent_reasoning.loss_schedule.update_interval 100", result.stdout)
-        self.assertIn("--framework.latent_reasoning.loss_schedule.temperature 2.0", result.stdout)
-        self.assertIn("--framework.latent_reasoning.loss_schedule.ema_decay 0.9", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.update_interval 500", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.temperature 0.5", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.ema_decay 0.5", result.stdout)
         self.assertIn("--framework.latent_reasoning.loss_schedule.auxiliary_budget 0.30", result.stdout)
         self.assertIn("--run_id space2act_libero_dwa_sfp_100k", result.stdout)
         self.assertNotIn("LOSS_SCHEDULE_MODE", source)

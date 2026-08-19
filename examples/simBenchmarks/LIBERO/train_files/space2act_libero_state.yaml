@@ -49,9 +49,10 @@ framework:
       diagnostic_interval: 0
       auxiliary_budget: 0.30
       warmup_steps: 5000
-      temperature: 2.0
-      ema_decay: 0.9
-      update_interval: 100
+      # DWA compares adjacent optimizer-step windows, not adjacent batches.
+      temperature: 0.5
+      ema_decay: 0.5
+      update_interval: 500
       knots:
         - step: 0
           weights: {spatial: 0.0, future: 0.0, plan: 0.0}

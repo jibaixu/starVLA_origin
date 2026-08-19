@@ -120,7 +120,7 @@ def _normalize_dwa_config(schedule_cfg, active_channels) -> dict[str, float | in
             raise ValueError(f"DWA {name} must be finite, >= {minimum}{upper}")
         return value
 
-    interval = schedule_cfg.get("update_interval", 100)
+    interval = schedule_cfg.get("update_interval", 500)
     if isinstance(interval, bool) or int(interval) != float(interval) or int(interval) <= 0:
         raise ValueError("DWA update_interval must be a positive integer")
     warmup_steps = schedule_cfg.get("warmup_steps", 5000)
@@ -131,8 +131,8 @@ def _normalize_dwa_config(schedule_cfg, active_channels) -> dict[str, float | in
         "enabled": True,
         "mode": "dwa",
         "auxiliary_budget": finite_float("auxiliary_budget", 0.30, 0.0),
-        "temperature": finite_float("temperature", 2.0, 1e-6),
-        "ema_decay": finite_float("ema_decay", 0.9, 0.0, 1.0),
+        "temperature": finite_float("temperature", 0.5, 1e-6),
+        "ema_decay": finite_float("ema_decay", 0.5, 0.0, 1.0),
         "update_interval": int(interval),
         "warmup_steps": int(warmup_steps),
     }
@@ -179,9 +179,9 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
                 "diagnostic_interval": 0,
                 "auxiliary_budget": 0.30,
                 "warmup_steps": 5000,
-                "temperature": 2.0,
-                "ema_decay": 0.9,
-                "update_interval": 100,
+                "temperature": 0.5,
+                "ema_decay": 0.5,
+                "update_interval": 500,
                 "knots": [],
             },
             "channels": {
@@ -310,6 +310,14 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         self.dwa_loss_history: dict[str, list[float]] = {channel: [] for channel in self.dwa_channels}
         self.dwa_loss_ema: dict[str, float | None] = {channel: None for channel in self.dwa_channels}
         self.dwa_rates: dict[str, float] = {channel: 1.0 for channel in self.dwa_channels}
+        self.dwa_log_rates: dict[str, float] = {channel: 0.0 for channel in self.dwa_channels}
+        self.dwa_log_rate_initialized: dict[str, bool] = {
+            channel: False for channel in self.dwa_channels
+        }
+        self.dwa_window_loss_sum: dict[str, float] = {
+            channel: 0.0 for channel in self.dwa_channels
+        }
+        self.dwa_window_steps = 0
         self.loss_diagnostic_interval = int(schedule_cfg.get("diagnostic_interval", 0))
         if self.loss_diagnostic_interval < 0:
             raise ValueError("loss_schedule diagnostic_interval must be non-negative")
@@ -455,35 +463,70 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         channel_losses: dict[str, torch.Tensor],
         should_update: bool,
     ) -> bool:
-        """Update EMA/rates once per optimizer step; return whether weights changed."""
+        """Update DWA from adjacent optimizer-step windows; return whether weights changed."""
         if not self.dwa_enabled or not should_update:
             return False
         step = int(training_step)
         warmup_steps = int(self.dwa_config["warmup_steps"])
         if step <= warmup_steps:
             return False
-        decay = float(self.dwa_config["ema_decay"])
-        for channel in self.dwa_channels:
-            if channel not in channel_losses:
-                continue
-            loss_value = float(self._distributed_scalar(channel_losses[channel]).item())
-            previous = self.dwa_loss_ema[channel]
-            current = loss_value if previous is None else decay * previous + (1.0 - decay) * loss_value
-            self.dwa_loss_ema[channel] = current
-            history = self.dwa_loss_history[channel]
-            history.append(current)
-            del history[:-2]
-
         interval = int(self.dwa_config["update_interval"])
-        if (step - warmup_steps) % interval != 0:
+        if any(channel not in channel_losses for channel in self.dwa_channels):
             return False
 
+        # Accumulate optimizer-step means. The previous implementation compared
+        # adjacent EMA updates even when update_interval was 100, so its ratio
+        # was effectively a one-step ratio and stayed almost exactly at 1.
+        for channel in self.dwa_channels:
+            loss_value = float(self._distributed_scalar(channel_losses[channel]).item())
+            if not math.isfinite(loss_value) or loss_value < 0.0:
+                raise ValueError(f"DWA loss for channel '{channel}' must be finite and non-negative")
+            self.dwa_window_loss_sum[channel] += loss_value
+        self.dwa_window_steps += 1
+        if self.dwa_window_steps < interval:
+            return False
+
+        window_means = {
+            channel: self.dwa_window_loss_sum[channel] / self.dwa_window_steps
+            for channel in self.dwa_channels
+        }
+        self.dwa_window_loss_sum = {channel: 0.0 for channel in self.dwa_channels}
+        self.dwa_window_steps = 0
+
+        decay = float(self.dwa_config["ema_decay"])
         eps = 1e-8
         for channel in self.dwa_channels:
+            window_mean = window_means[channel]
+            previous_ema = self.dwa_loss_ema[channel]
+            current_ema = (
+                window_mean
+                if previous_ema is None
+                else decay * previous_ema + (1.0 - decay) * window_mean
+            )
+            self.dwa_loss_ema[channel] = current_ema
             history = self.dwa_loss_history[channel]
-            self.dwa_rates[channel] = history[-1] / max(history[-2], eps) if len(history) >= 2 else 1.0
+            history.append(current_ema)
+            del history[:-2]
+            if len(history) < 2:
+                continue
+
+            previous_ema = history[-2]
+            rate = max(current_ema, eps) / max(previous_ema, eps)
+            raw_log_rate = math.log(max(current_ema, eps)) - math.log(max(previous_ema, eps))
+            self.dwa_rates[channel] = rate
+            if self.dwa_log_rate_initialized[channel]:
+                self.dwa_log_rates[channel] = (
+                    decay * self.dwa_log_rates[channel] + (1.0 - decay) * raw_log_rate
+                )
+            else:
+                self.dwa_log_rates[channel] = raw_log_rate
+                self.dwa_log_rate_initialized[channel] = True
+
+        if not all(self.dwa_log_rate_initialized.values()):
+            return False
+
         rates = torch.tensor(
-            [self.dwa_rates[channel] for channel in self.dwa_channels], dtype=torch.float32
+            [self.dwa_log_rates[channel] for channel in self.dwa_channels], dtype=torch.float32
         )
         temperature = float(self.dwa_config["temperature"])
         weights = torch.softmax(rates / temperature, dim=0)
@@ -494,6 +537,13 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         }
         return True
 
+    def _dwa_weight_entropy(self) -> float:
+        budget = float(self.dwa_config.get("auxiliary_budget", 0.0))
+        if budget <= 0.0 or not self.dwa_channels:
+            return 0.0
+        probabilities = [max(self.dwa_weights[channel] / budget, 0.0) for channel in self.dwa_channels]
+        return float(-sum(probability * math.log(max(probability, 1e-12)) for probability in probabilities))
+
     def update_adaptive_state(      #! 由外部训练主流程直接调用，然后触发 DWA 状态更新
         self,
         training_step: int,
@@ -502,18 +552,25 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
     ) -> dict[str, float]:
         """Advance DWA state at an optimizer-step boundary."""
         #! _update_dwa_state内部会进行非dwa模式拦截
+        previous_weights = dict(self.dwa_weights)
         updated = self._update_dwa_state(training_step, channel_losses, should_update)
         metrics = {
             "dwa_state_updated": float(updated),
             "dwa_weight_sum": float(sum(self.dwa_weights.values())),
             "dwa_ready": float(
-                all(len(self.dwa_loss_history[channel]) >= 2 for channel in self.dwa_channels)
+                all(self.dwa_log_rate_initialized[channel] for channel in self.dwa_channels)
             ),
+            "dwa_window_steps": float(self.dwa_window_steps),
+            "dwa_weight_entropy": self._dwa_weight_entropy(),
         }
         for channel in self.dwa_channels:
             metrics[f"dwa_loss_ema/{channel}"] = float(self.dwa_loss_ema[channel] or 0.0)
             metrics[f"dwa_rate/{channel}"] = float(self.dwa_rates[channel])
+            metrics[f"dwa_log_rate/{channel}"] = float(self.dwa_log_rates[channel])
             metrics[f"dwa_weight/{channel}"] = float(self.dwa_weights[channel])
+            metrics[f"dwa_weight_delta/{channel}"] = float(
+                self.dwa_weights[channel] - previous_weights[channel]
+            )
         return metrics
 
     def get_adaptive_state(self) -> dict:
@@ -522,11 +579,16 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             return {"mode": "fixed"}
         return {
             "mode": "dwa",
+            "state_version": 2,
             "channels": list(self.dwa_channels),
             "weights": dict(self.dwa_weights),
             "loss_history": {channel: list(values) for channel, values in self.dwa_loss_history.items()},
             "loss_ema": dict(self.dwa_loss_ema),
             "rates": dict(self.dwa_rates),
+            "log_rates": dict(self.dwa_log_rates),
+            "log_rate_initialized": dict(self.dwa_log_rate_initialized),
+            "window_loss_sum": dict(self.dwa_window_loss_sum),
+            "window_steps": int(self.dwa_window_steps),
         }
 
     def set_adaptive_state(self, state: dict | None) -> None:
@@ -535,6 +597,20 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             return
         if tuple(state.get("channels", ())) != self.dwa_channels:
             raise ValueError("DWA checkpoint channels do not match the current model")
+        # Old sidecars encoded adjacent optimizer-step EMA values. Preserve the
+        # model checkpoint but restart only the incompatible DWA runtime state.
+        if int(state.get("state_version", 1)) < 2:
+            budget = float(self.dwa_config["auxiliary_budget"])
+            initial_weight = budget / len(self.dwa_channels) if self.dwa_channels else 0.0
+            self.dwa_weights = {channel: initial_weight for channel in self.dwa_channels}
+            self.dwa_loss_history = {channel: [] for channel in self.dwa_channels}
+            self.dwa_loss_ema = {channel: None for channel in self.dwa_channels}
+            self.dwa_rates = {channel: 1.0 for channel in self.dwa_channels}
+            self.dwa_log_rates = {channel: 0.0 for channel in self.dwa_channels}
+            self.dwa_log_rate_initialized = {channel: False for channel in self.dwa_channels}
+            self.dwa_window_loss_sum = {channel: 0.0 for channel in self.dwa_channels}
+            self.dwa_window_steps = 0
+            return
         for channel in self.dwa_channels:
             history = [float(value) for value in state.get("loss_history", {}).get(channel, [])]
             if len(history) > 2 or any(not math.isfinite(value) or value < 0.0 for value in history):
@@ -543,7 +619,31 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             ema = state.get("loss_ema", {}).get(channel, None)
             self.dwa_loss_ema[channel] = None if ema is None else float(ema)
             self.dwa_rates[channel] = float(state.get("rates", {}).get(channel, 1.0))
+            self.dwa_log_rates[channel] = float(state.get("log_rates", {}).get(channel, 0.0))
+            self.dwa_log_rate_initialized[channel] = bool(
+                state.get("log_rate_initialized", {}).get(channel, len(history) >= 2)
+            )
             self.dwa_weights[channel] = float(state.get("weights", {}).get(channel, self.dwa_weights[channel]))
+            if self.dwa_loss_ema[channel] is not None and (
+                not math.isfinite(self.dwa_loss_ema[channel]) or self.dwa_loss_ema[channel] < 0.0
+            ):
+                raise ValueError(f"Invalid DWA EMA for channel '{channel}'")
+            if not math.isfinite(self.dwa_rates[channel]) or self.dwa_rates[channel] <= 0.0:
+                raise ValueError(f"Invalid DWA rate for channel '{channel}'")
+            if not math.isfinite(self.dwa_log_rates[channel]):
+                raise ValueError(f"Invalid DWA log rate for channel '{channel}'")
+        self.dwa_window_loss_sum = {
+            channel: float(state.get("window_loss_sum", {}).get(channel, 0.0))
+            for channel in self.dwa_channels
+        }
+        self.dwa_window_steps = int(state.get("window_steps", 0))
+        interval = int(self.dwa_config["update_interval"])
+        if self.dwa_window_steps < 0 or self.dwa_window_steps >= interval:
+            raise ValueError("Invalid DWA window_steps in checkpoint")
+        if any(
+            not math.isfinite(value) or value < 0.0 for value in self.dwa_window_loss_sum.values()
+        ):
+            raise ValueError("Invalid DWA window loss state in checkpoint")
         budget = float(self.dwa_config["auxiliary_budget"])
         if any(weight < 0.0 or not math.isfinite(weight) for weight in self.dwa_weights.values()):
             raise ValueError("Invalid DWA weights in checkpoint")
@@ -555,9 +655,11 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             "dwa_state_updated": reference.new_tensor(float(updated), dtype=torch.float32),
             "dwa_weight_sum": reference.new_tensor(sum(self.dwa_weights.values()), dtype=torch.float32),
             "dwa_ready": reference.new_tensor(
-                float(all(len(self.dwa_loss_history[channel]) >= 2 for channel in self.dwa_channels)),
+                float(all(self.dwa_log_rate_initialized[channel] for channel in self.dwa_channels)),
                 dtype=torch.float32,
             ),
+            "dwa_window_steps": reference.new_tensor(float(self.dwa_window_steps), dtype=torch.float32),
+            "dwa_weight_entropy": reference.new_tensor(self._dwa_weight_entropy(), dtype=torch.float32),
         }
         for channel in self.dwa_channels:
             metrics[f"dwa_loss_ema/{channel}"] = reference.new_tensor(
@@ -565,6 +667,9 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                 dtype=torch.float32,
             )
             metrics[f"dwa_rate/{channel}"] = reference.new_tensor(self.dwa_rates[channel], dtype=torch.float32)
+            metrics[f"dwa_log_rate/{channel}"] = reference.new_tensor(
+                self.dwa_log_rates[channel], dtype=torch.float32
+            )
             metrics[f"dwa_weight/{channel}"] = reference.new_tensor(self.dwa_weights[channel], dtype=torch.float32)
         return metrics
 
@@ -584,7 +689,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             "gradient_norm/action_hidden": torch.linalg.vector_norm(action_grad),
         }
         aggregate_aux_grad = torch.zeros_like(action_grad)
-        eps = torch.finfo(torch.float32).eps
+        tiny = torch.finfo(torch.float32).tiny
 
         for channel, channel_loss in channel_losses.items():
             weighted_loss = effective_weights[channel] * channel_loss
@@ -599,8 +704,11 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             auxiliary_typed_grad = torch.gather(auxiliary_grad, 1, gather_index).reshape(-1)
             action_norm = torch.linalg.vector_norm(action_typed_grad)
             auxiliary_norm = torch.linalg.vector_norm(auxiliary_typed_grad)
-            cosine = torch.dot(action_typed_grad, auxiliary_typed_grad) / (
-                action_norm * auxiliary_norm + eps
+            denominator = action_norm * auxiliary_norm
+            cosine = torch.where(
+                denominator > tiny,
+                torch.dot(action_typed_grad, auxiliary_typed_grad) / denominator.clamp_min(tiny),
+                torch.zeros_like(denominator),
             )
             diagnostics[f"gradient_norm/{channel}_alignment_hidden"] = auxiliary_norm
             diagnostics[f"gradient_cosine/{channel}_vs_action"] = cosine
@@ -608,8 +716,10 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         aggregate_norm = torch.linalg.vector_norm(aggregate_aux_grad)
         action_norm = diagnostics["gradient_norm/action_hidden"]
         diagnostics["gradient_norm/alignment_hidden"] = aggregate_norm
-        diagnostics["gradient_ratio/alignment_to_action_hidden"] = aggregate_norm / (
-            action_norm + eps
+        diagnostics["gradient_ratio/alignment_to_action_hidden"] = torch.where(
+            action_norm > tiny,
+            aggregate_norm / action_norm.clamp_min(tiny),
+            torch.zeros_like(action_norm),
         )
         return {name: value.detach() for name, value in diagnostics.items()}
 

@@ -573,9 +573,11 @@ loss 的课程变化，action loss 始终以 1.0 权重训练，旧教师也以�
 typed-token 位置与 action 梯度的 cosine。第一版只做诊断，不自动应用 GradNorm/PCGrad。
 
 独立入口 `run_space2act_dwa_train.sh` 提供 `loss_schedule.mode=dwa` 自适应权重消融：前 5k 个 optimizer step
-只训练 action loss，之后在固定的 0.30 auxiliary budget 内，对 S/F/P 的 EMA loss ratio
-按 temperature-softmax 每 100 步更新权重。DWA 的 EMA、最近两次 loss history、ratio 和当前
-权重写入每个 checkpoint 旁的 `steps_N_adaptive.json`，恢复训练时一并加载。DWA 与 fixed
+只训练 action loss，之后在固定的 0.30 auxiliary budget 内，对相邻 optimizer-step 窗口的
+EMA loss ratio 做 temperature-softmax 更新；`update_interval` 表示每个窗口包含的优化步数，
+而不是把相邻 batch 当作 ratio。DWA 的窗口累积、EMA、最近两次窗口 history、ratio、log-ratio
+和当前权重写入每个 checkpoint 旁的 `steps_N_adaptive.json`，恢复训练时一并加载。旧版
+sidecar 的相邻步状态不会直接混用，恢复模型后会从均分权重重新收集窗口。DWA 与 fixed
 knots 互斥；progressive 入口只运行 fixed knots 调度。PCGrad/GradNorm 暂不自动
 介入，只有梯度诊断显示稳定且显著的通道冲突时才进入后续消融。
 
