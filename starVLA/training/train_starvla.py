@@ -494,6 +494,30 @@ class VLATrainer(TrainerUtils):
 
         return batch_vla
 
+    def _perf_rank_timing(self, data_time: float, model_time: float) -> dict[str, float]:
+        """Optionally aggregate per-rank timings for short performance probes."""
+        if os.environ.get("STARVLA_PERF_RANK_TIMING", "0").lower() not in {"1", "true", "yes", "on"}:
+            return {}
+        values = torch.tensor([data_time, model_time], device=self.accelerator.device, dtype=torch.float64)
+        if dist.is_available() and dist.is_initialized():
+            total = values.clone()
+            minimum = values.clone()
+            maximum = values.clone()
+            dist.all_reduce(total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+            dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+            total /= dist.get_world_size()
+        else:
+            total = minimum = maximum = values
+        return {
+            "perf/rank_data_mean": float(total[0].item()),
+            "perf/rank_data_min": float(minimum[0].item()),
+            "perf/rank_data_max": float(maximum[0].item()),
+            "perf/rank_model_mean": float(total[1].item()),
+            "perf/rank_model_min": float(minimum[1].item()),
+            "perf/rank_model_max": float(maximum[1].item()),
+        }
+
     def train(self):
         """Execute training loop."""
         self._log_training_config()
@@ -530,6 +554,14 @@ class VLATrainer(TrainerUtils):
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
+            perf_interval = int(os.environ.get("STARVLA_PERF_RANK_TIMING_INTERVAL", "10"))
+            if self.completed_steps > 0 and perf_interval > 0 and self.completed_steps % perf_interval == 0:
+                step_metrics.update(
+                    self._perf_rank_timing(
+                        t_end_data - t_start_data,
+                        t_end_model - t_start_model,
+                    )
+                )
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
