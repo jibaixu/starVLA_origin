@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
+from torch.utils.data import DataLoader, Dataset
 
 from starVLA.dataloader.gr00t_lerobot.teacher_latents import (
     EpisodeTeacherStore,
@@ -30,6 +31,7 @@ from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
     _normalize_loss_schedule,
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
+from tools.pack_teacher_latents import pack
 
 
 def _write_teacher(
@@ -65,6 +67,51 @@ class Space2ActTest(unittest.TestCase):
             self.assertTrue(torch.equal(store.get(0, 15), features[0]))
             self.assertTrue(torch.equal(store.get(0, 16), features[1]))
             self.assertTrue(torch.equal(store.get(0, 100), features[2]))
+
+    def test_packed_teacher_store_matches_safetensors(self):
+        """The optional packed backend must preserve teacher values and anchors exactly."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            features = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4)
+            _write_teacher(root, features, torch.tensor([0, 16, 32]))
+            pack(root, "latents", "latents_packed")
+            store = EpisodeTeacherStore(
+                root,
+                TeacherChannelSpec("spatial", "latents", 2, 4, packed_relative_dir="latents_packed"),
+                [0],
+            )
+            self.assertTrue(torch.equal(store.get(0, 15), features[0]))
+            self.assertTrue(torch.equal(store.get(0, 16), features[1]))
+            self.assertTrue(torch.equal(store.get(0, 100), features[2]))
+
+            packed_row = store.get(0, 16)
+            self.assertEqual(packed_row.untyped_storage().nbytes(), packed_row.numel() * packed_row.element_size())
+
+    def test_packed_teacher_row_survives_dataloader_worker_ipc(self):
+        """Packed rows must not make workers share the full mmap-backed file."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            features = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4)
+            _write_teacher(root, features, torch.tensor([0, 16, 32]))
+            pack(root, "latents", "latents_packed")
+            store = EpisodeTeacherStore(
+                root,
+                TeacherChannelSpec("spatial", "latents", 2, 4, packed_relative_dir="latents_packed"),
+                [0],
+            )
+
+            class _TeacherRows(Dataset):
+                def __len__(self):
+                    return 4
+
+                def __getitem__(self, index):
+                    return store.get(0, index * 16)
+
+            loader = DataLoader(_TeacherRows(), batch_size=2, num_workers=1)
+            batch = next(iter(loader))
+            self.assertEqual(tuple(batch.shape), (2, 2, 4))
+            self.assertTrue(torch.equal(batch[0], features[0]))
+            self.assertTrue(torch.equal(batch[1], features[1]))
 
     def test_teacher_store_fails_on_shape_mismatch(self):
         """教师张量与配置契约不一致时，应在建索引阶段尽早报错。"""
@@ -848,6 +895,7 @@ class Space2ActTest(unittest.TestCase):
         self.assertTrue(routing.replace_typed_tokens)
         future = cfg.framework.latent_reasoning.channels.future
         teacher = cfg.datasets.vla_data.teacher_latents.channels.future
+        self.assertNotIn("load_policy", cfg.datasets.vla_data.teacher_latents)
         self.assertEqual((future.target_tokens, future.target_dim), (1125, 3072))
         self.assertEqual(teacher.anchor_stride, 8)
         self.assertEqual(teacher.expected_metadata.block_index, "20")
@@ -896,6 +944,14 @@ class Space2ActTest(unittest.TestCase):
         self.assertIn("teacher_latents.channels.plan.relative_dir", train_text)
         self.assertNotIn("Stage 3 is not implemented", train_text)
         self.assertNotIn("requires INIT_CHECKPOINT to point", train_text)
+
+        dwa_text = (
+            repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh"
+        ).read_text()
+        self.assertNotIn("active_loss", dwa_text)
+        self.assertNotIn("TEACHER_LOAD_POLICY", dwa_text)
+        self.assertNotIn("teacher_latents.load_policy", dwa_text)
 
         eval_text = shell_paths[1].read_text()
         self.assertIn("space2act_libero_stage3", eval_text)

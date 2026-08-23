@@ -448,15 +448,6 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
         return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
 
-    @staticmethod
-    def _distributed_scalar(value: torch.Tensor) -> torch.Tensor:
-        """Return a detached global mean without affecting the training graph."""
-        value = value.detach().float().clone()
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(value, op=dist.ReduceOp.SUM)
-            value.div_(dist.get_world_size())
-        return value
-
     def _update_dwa_state(
         self,
         training_step: int,
@@ -474,11 +465,16 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if any(channel not in channel_losses for channel in self.dwa_channels):
             return False
 
-        # Accumulate optimizer-step means. The previous implementation compared
-        # adjacent EMA updates even when update_interval was 100, so its ratio
-        # was effectively a one-step ratio and stayed almost exactly at 1.
-        for channel in self.dwa_channels:
-            loss_value = float(self._distributed_scalar(channel_losses[channel]).item())
+        # Preserve globally averaged partial-window state so checkpoints remain
+        # resumable at any step, but reduce all channels in one collective.
+        loss_values = torch.stack(
+            [channel_losses[channel].detach().float() for channel in self.dwa_channels]
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_values, op=dist.ReduceOp.SUM)
+            loss_values.div_(dist.get_world_size())
+        for index, channel in enumerate(self.dwa_channels):
+            loss_value = float(loss_values[index].item())
             if not math.isfinite(loss_value) or loss_value < 0.0:
                 raise ValueError(f"DWA loss for channel '{channel}' must be finite and non-negative")
             self.dwa_window_loss_sum[channel] += loss_value

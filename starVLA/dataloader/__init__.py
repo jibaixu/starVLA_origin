@@ -3,12 +3,36 @@ import os
 from accelerate.logging import get_logger
 import numpy as np
 from torch.utils.data import DataLoader
+import torch
 import numpy as np
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 
 logger = get_logger(__name__)
+
+
+def _configure_multiprocessing_sharing(vla_dataset_cfg) -> str:
+    """Configure torch tensor IPC before DataLoader workers are started.
+
+    ``file_descriptor`` is the historical PyTorch default, but it can exhaust
+    transient FDs when workers return large teacher tensors. ``file_system``
+    keeps the same tensor values and DataLoader semantics while avoiding that
+    per-storage FD handoff. Legacy configs retain the default strategy.
+    """
+    requested = str(vla_dataset_cfg.get("mp_sharing_strategy", "default")).lower()
+    if requested == "default":
+        strategy = torch.multiprocessing.get_sharing_strategy()
+    elif requested in {"file_descriptor", "file_system"}:
+        torch.multiprocessing.set_sharing_strategy(requested)
+        strategy = requested
+    else:
+        raise ValueError(
+            "datasets.vla_data.mp_sharing_strategy must be 'default', "
+            "'file_descriptor', or 'file_system'"
+        )
+    logger.info("DataLoader multiprocessing sharing strategy: %s", strategy)
+    return strategy
 
 def save_dataset_statistics(dataset_statistics, run_dir):
     """Saves a `dataset_statistics.json` file."""
@@ -39,6 +63,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
 
+        sharing_strategy = _configure_multiprocessing_sharing(vla_dataset_cfg)
+
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
@@ -57,6 +83,14 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         if num_workers > 0:
             dataloader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             dataloader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 2))
+
+        logger.info(
+            "DataLoader settings: num_workers=%d, prefetch_factor=%s, pin_memory=%s, sharing=%s",
+            num_workers,
+            dataloader_kwargs.get("prefetch_factor", 0),
+            dataloader_kwargs["pin_memory"],
+            sharing_strategy,
+        )
 
         vla_train_dataloader = DataLoader(
             vla_dataset,

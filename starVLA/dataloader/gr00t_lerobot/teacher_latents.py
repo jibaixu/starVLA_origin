@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ class TeacherChannelSpec:
     anchor_stride: int | None = None
     validate_episode_length: bool = False
     expected_metadata: dict[str, str] | None = None
+    packed_relative_dir: str | None = None
 
     @classmethod
     def from_config(cls, name: str, config: Any) -> "TeacherChannelSpec":
@@ -66,6 +68,11 @@ class TeacherChannelSpec:
             expected_metadata={
                 str(key): str(value) for key, value in config.get("expected_metadata", {}).items()
             },
+            packed_relative_dir=(
+                str(config.get("packed_relative_dir"))
+                if config.get("packed_relative_dir", None) not in (None, "", "null")
+                else None
+            ),
         )
 
 
@@ -105,13 +112,22 @@ class EpisodeTeacherStore:
             int(episode_id): int(length) for episode_id, length in (episode_lengths or {}).items()
         }
         teacher_root = self.dataset_path / spec.relative_dir
+
+        self._episode_paths: dict[int, Path] = {}
+        self._anchors: dict[int, torch.Tensor] = {}
+        self._packed_features: torch.Tensor | None = None
+        self._packed_offsets: dict[int, int] = {}
+        self._packed_counts: dict[int, int] = {}
+        packed_root = self.dataset_path / spec.packed_relative_dir if spec.packed_relative_dir else None
+        if packed_root is not None:
+            if not packed_root.is_dir():
+                raise FileNotFoundError(f"Packed teacher directory does not exist: {packed_root}")
+            self._load_packed(packed_root, episode_ids, episode_lengths)
+            return
         if not teacher_root.is_dir():
             raise FileNotFoundError(
                 f"Space2Act teacher directory for '{spec.name}' does not exist: {teacher_root}"
             )
-
-        self._episode_paths: dict[int, Path] = {}
-        self._anchors: dict[int, torch.Tensor] = {}
         # 文件名中的 episode id 是数据集内的主键。提前检查重复文件，避免
         # glob 顺序决定训练时实际使用哪一份 teacher，造成不可复现实验。
         for path in teacher_root.glob("**/episode_*.safetensors"):
@@ -232,8 +248,86 @@ class EpisodeTeacherStore:
                     )
             self._anchors[episode_id] = anchor_values
 
+    def _load_packed(
+        self, packed_root: Path, episode_ids, episode_lengths: dict[int, int] | None
+    ) -> None:
+        """Load an optional exact packed representation without opening episode files per sample."""
+        manifest_path = packed_root / "manifest.json"
+        features_path = packed_root / "features.bin"
+        if not manifest_path.is_file() or not features_path.is_file():
+            raise FileNotFoundError(f"Packed teacher store is incomplete under {packed_root}")
+        manifest = json.loads(manifest_path.read_text())
+        shape = tuple(manifest.get("feature_shape", ()))
+        expected_tail = (self.spec.target_tokens, self.spec.target_dim)
+        if len(shape) != 3 or tuple(shape[1:]) != expected_tail:
+            raise ValueError(
+                f"Packed teacher '{self.spec.name}' shape mismatch: expected [A,{expected_tail[0]},{expected_tail[1]}], got {shape}"
+            )
+        dtype_name = _canonical_dtype(manifest.get("dtype", ""))
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(dtype_name)
+        if dtype is None:
+            raise ValueError(f"Unsupported packed teacher dtype: {manifest.get('dtype')!r}")
+        episodes = manifest.get("episodes", {})
+        requested = [int(episode_id) for episode_id in episode_ids]
+        missing = [episode_id for episode_id in requested if str(episode_id) not in episodes]
+        if missing:
+            raise FileNotFoundError(f"Packed teacher '{self.spec.name}' is missing episodes: {missing[:10]}")
+        total_elements = int(shape[0]) * int(shape[1]) * int(shape[2])
+        expected_bytes = total_elements * torch.empty((), dtype=dtype).element_size()
+        if features_path.stat().st_size != expected_bytes:
+            raise ValueError(
+                f"Packed teacher file size mismatch: got {features_path.stat().st_size}, expected {expected_bytes}"
+            )
+        self._packed_features = torch.from_file(
+            str(features_path), shared=False, size=total_elements, dtype=dtype
+        ).view(shape)
+        for episode_id in requested:
+            info = episodes[str(episode_id)]
+            metadata = {str(key): str(value) for key, value in info.get("metadata", {}).items()}
+            for key, expected_value in (self.spec.expected_metadata or {}).items():
+                if metadata.get(key) != expected_value:
+                    raise ValueError(
+                        f"Packed teacher metadata mismatch for episode {episode_id}: "
+                        f"{key}={metadata.get(key)!r}, expected {expected_value!r}"
+                    )
+            if "episode_index" in metadata and int(metadata["episode_index"]) != episode_id:
+                raise ValueError(f"Packed teacher episode_index mismatch for episode {episode_id}")
+            anchors = torch.tensor(info["anchors"], dtype=torch.long)
+            if anchors.numel() == 0 or torch.any(anchors[1:] <= anchors[:-1]):
+                raise ValueError(f"Packed teacher anchors are not strictly increasing for episode {episode_id}")
+            self._anchors[episode_id] = anchors
+            self._packed_offsets[episode_id] = int(info["offset"])
+            self._packed_counts[episode_id] = int(info["count"])
+            if self._packed_counts[episode_id] != anchors.numel():
+                raise ValueError(f"Packed teacher count mismatch for episode {episode_id}")
+            if self._packed_offsets[episode_id] < 0 or (
+                self._packed_offsets[episode_id] + self._packed_counts[episode_id] > shape[0]
+            ):
+                raise ValueError(f"Packed teacher offset is out of bounds for episode {episode_id}")
+            if self.spec.anchor_stride is not None and anchors.numel() > 1:
+                if torch.any(anchors[1:] - anchors[:-1] != self.spec.anchor_stride):
+                    raise ValueError(f"Packed teacher anchor stride mismatch for episode {episode_id}")
+            if self.spec.validate_episode_length:
+                length = (episode_lengths or {}).get(episode_id)
+                if length is None:
+                    raise ValueError("Episode length is required to validate packed teacher anchors")
+                expected = torch.arange(0, int(length), int(self.spec.anchor_stride))
+                if not torch.equal(anchors, expected):
+                    raise ValueError(f"Packed teacher anchors do not cover episode {episode_id}")
+
     def get(self, episode_id: int, frame_index: int) -> torch.Tensor:
         """返回离当前帧最近且不晚于当前帧的 teacher feature。"""
+        if self._packed_features is not None:
+            episode_id = int(episode_id)
+            anchors = self._anchors[episode_id]
+            anchor_index = int(torch.searchsorted(anchors, int(frame_index), right=True).item()) - 1
+            anchor_index = max(0, min(anchor_index, anchors.numel() - 1))
+            row = self._packed_offsets[episode_id] + anchor_index
+            # A row view from torch.from_file is already contiguous, so
+            # ``contiguous()`` would keep the entire mmap-backed storage.
+            # Clone the row before DataLoader IPC; otherwise a worker tries to
+            # share the complete packed file for every sample and can SIGBUS.
+            return self._packed_features[row].clone()
         path = self._episode_paths[int(episode_id)]
         with safe_open(path, framework="pt", device="cpu") as reader:
             anchors = self._anchors[int(episode_id)]

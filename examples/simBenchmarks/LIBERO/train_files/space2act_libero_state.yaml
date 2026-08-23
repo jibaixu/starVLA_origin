@@ -122,6 +122,9 @@ datasets:
     video_backend: torchvision_av
     num_workers: 8
     persistent_workers: true
+    # default preserves PyTorch's historical IPC behavior. Set file_system for
+    # multi-worker teacher probes that return large tensors.
+    mp_sharing_strategy: default
     # 本地试跑只读取每个子数据集的 episode 0、1、2，与当前已提取样例对应。
     # 当服务器上所有 episode 的教师文件齐全后，可设为 null 使用完整数据集。
     episode_indices: null
@@ -132,6 +135,9 @@ datasets:
         spatial:
           enabled: ${framework.latent_reasoning.channels.spatial.alignment_enabled}
           relative_dir: lingbot_latent_step4_numlayer24_stride16
+          # Optional exact mmap-packed representation. null keeps legacy
+          # safetensors episode files, so progressive/evidence runs are unchanged.
+          packed_relative_dir: null
           target_tokens: ${framework.latent_reasoning.channels.spatial.target_tokens}
           target_dim: ${framework.latent_reasoning.channels.spatial.target_dim}
           feature_key: features
@@ -151,6 +157,7 @@ datasets:
         future:
           enabled: ${framework.latent_reasoning.channels.future.alignment_enabled}
           relative_dir: wan2_2_future_latent_h16_step20_block20z_stride8_480x480
+          packed_relative_dir: null
           target_tokens: ${framework.latent_reasoning.channels.future.target_tokens}
           target_dim: ${framework.latent_reasoning.channels.future.target_dim}
           feature_key: features
@@ -180,6 +187,7 @@ datasets:
         plan:
           enabled: ${framework.latent_reasoning.channels.plan.alignment_enabled}
           relative_dir: moto_plan_latent_pre_vq_delta4x4_h16_stride1_epoch10
+          packed_relative_dir: null
           target_tokens: ${framework.latent_reasoning.channels.plan.target_tokens}
           target_dim: ${framework.latent_reasoning.channels.plan.target_dim}
           feature_key: features

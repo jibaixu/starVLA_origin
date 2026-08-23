@@ -1436,7 +1436,7 @@ class LeRobotSingleDataset(Dataset):
             "robot_tag": self.tag
         }
 
-        # 教师特征只在对应通道启用时读取。trajectory_id 定位 episode 文件，
+        # 教师特征按已启用通道读取。trajectory_id 定位 episode 文件，
         # base_index 定位当前帧；store 内部再将当前帧映射到最近的历史 anchor。
         if self._teacher_stores:
             if trajectory_id is None or base_index is None:
