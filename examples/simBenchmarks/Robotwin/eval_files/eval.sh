@@ -52,6 +52,20 @@ policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
+# Keep direct eval.sh invocations independent from the caller's Conda
+# activation. RoboTwin's evaluator starts ffmpeg by command name.
+if [[ "${robotwin_python}" == */* ]]; then
+    robotwin_bin_dir="$(cd "$(dirname "${robotwin_python}")" 2>/dev/null && pwd)"
+    export PATH="${robotwin_bin_dir}:${PATH}"
+fi
+if ! ffmpeg_path="$(command -v ffmpeg 2>/dev/null)" || [[ ! -x "${ffmpeg_path}" ]]; then
+    echo "ffmpeg is not available in PATH for RoboTwin evaluation." >&2
+    echo "ROBOTWIN_PYTHON=${robotwin_python}" >&2
+    echo "PATH=${PATH}" >&2
+    exit 1
+fi
+echo "ffmpeg: ${ffmpeg_path}"
+
 if [[ ! -f "${deploy_policy_template}" ]]; then
     echo "Deploy policy template does not exist: ${deploy_policy_template}" >&2
     exit 1
@@ -86,8 +100,10 @@ echo "task_config: ${task_config}"
 echo "ckpt_setting: ${ckpt_setting}"
 echo "policy_port: ${policy_port}"
 
-PYTHONWARNINGS=ignore::UserWarning \
-"${robotwin_python}" script/eval_policy.py --config "${runtime_deploy_policy}" \
+echo "robotwin_python: ${robotwin_python}"
+echo "robotwin_eval: launching unbuffered eval_policy.py"
+PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning \
+"${robotwin_python}" -u script/eval_policy.py --config "${runtime_deploy_policy}" \
     --policy_ckpt_path "${policy_ckpt_path}" \
     --overrides \
     --task_name "${task_name}" \

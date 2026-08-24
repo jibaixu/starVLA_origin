@@ -1,4 +1,5 @@
 from collections import deque
+import time
 from typing import Dict, Optional
 
 import cv2 as cv
@@ -69,9 +70,15 @@ class ModelClient:
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
         print(
+            f"[StarVLA] policy server connected: host={host} port={port} "
+            f"action_chunk_size={self.action_chunk_size}",
+            flush=True,
+        )
+        print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
-            f"server_meta: {server_meta} ***"
+            f"server_meta: {server_meta} ***",
+            flush=True,
         )
 
     def reset(self, task_description: str) -> None:
@@ -137,7 +144,24 @@ class ModelClient:
             #   - image order : the ordering of those camera views
             #   - action normalization: unnorm_key must match the training dataset stats
             # ==============================================================================
-            response = self.client.predict_action(vla_input)
+            print(f"[StarVLA] policy request start: step={step}", flush=True)
+            request_started = time.perf_counter()
+            try:
+                response = self.client.predict_action(vla_input)
+            except Exception as exc:
+                elapsed = time.perf_counter() - request_started
+                print(
+                    f"[StarVLA] policy request failed: step={step} "
+                    f"elapsed={elapsed:.2f}s error={exc!r}",
+                    flush=True,
+                )
+                raise
+            elapsed = time.perf_counter() - request_started
+            print(
+                f"[StarVLA] policy request done: step={step} "
+                f"elapsed={elapsed:.2f}s",
+                flush=True,
+            )
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
 
