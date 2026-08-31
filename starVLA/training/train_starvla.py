@@ -622,6 +622,10 @@ class VLATrainer(TrainerUtils):
                     # 梯度累积期间只在同步 micro-batch 做一次诊断，避免
                     # 同一 optimization step 重复执行 autograd.grad。
                     forward_kwargs["run_gradient_diagnostics"] = self.accelerator.sync_gradients
+                    # GradNorm probe 与诊断共享同步边界；在当前 ZeRO-2 配置中
+                    # gradient_accumulation_steps 固定为 1，因此每个同步 batch
+                    # 就是一个 optimizer step。
+                    forward_kwargs["run_gradient_probe"] = self.accelerator.sync_gradients
                 output_dict = self.model.forward(batch_vla, **forward_kwargs)
                 action_loss = output_dict["action_loss"]
                 # Space2Act 的 total_loss = 动作损失 + 各教师对齐损失；基础框架
@@ -642,7 +646,7 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-            #! DWA 状态更新触发。DWA 损失调度模式需要在训练主流程中主动触发
+            # DWA/GradNorm 的非参数状态在 optimizer step 完成后统一推进。
             adaptive_model = self.accelerator.unwrap_model(self.model)
             if getattr(adaptive_model, "dwa_enabled", False):
                 for channel in adaptive_model.dwa_channels:
@@ -658,10 +662,16 @@ class VLATrainer(TrainerUtils):
                     for channel, values in self._adaptive_loss_accumulator.items()
                     if values
                 }
+                channel_gradient_norms = {
+                    channel: output_dict[f"gradnorm_probe/{channel}"].detach()
+                    for channel in getattr(adaptive_model, "gradnorm_channels", ())
+                    if f"gradnorm_probe/{channel}" in output_dict
+                }
                 adaptive_metrics = adaptive_model.update_adaptive_state(
                     optimizer_step,
                     channel_losses,
                     should_update=True,
+                    channel_gradient_norms=channel_gradient_norms,
                 )
                 self._adaptive_loss_accumulator.clear()
             else:

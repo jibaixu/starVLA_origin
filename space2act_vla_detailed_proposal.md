@@ -30,6 +30,7 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_evidence_routing_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_gradnorm_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
@@ -47,7 +48,8 @@ global-step 传递和梯度诊断代码已经接入，但 100k-step progressive/
 成功率结果均尚未执行。
 
 下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout、额外
-resampler 或 PCGrad 梯度干预的内容，均应视为后续研究选项，而非当前 AISER 实现承诺。
+resampler 或 PCGrad 梯度干预的内容，均应视为后续研究选项，而非当前实现承诺。当前还提供
+独立的 GradNorm-style 梯度均衡权重入口，见第 3.3 节；PCGrad 仍未接入默认训练路径。
 
 ## 0. 方案定位
 
@@ -557,7 +559,7 @@ cold-start。模型从第 0 步起固定插入 S/F/P，并构造三路 mapper；
 hidden KV 长度、token 位置和 optimizer 参数集合在 100k 内保持不变。“三阶段”只表示教师
 loss 的课程变化，action loss 始终以 1.0 权重训练，旧教师也以较低权重继续参与：
 
-| optimization step | $\lambda_S$ | $\lambda_F$ | $\lambda_P$ | 说明 |
+| optimization step | effective S coefficient | effective F coefficient | effective P coefficient | 说明 |
 |---:|---:|---:|---:|---|
 | 0 | 0.00 | 0.00 | 0.00 | action-only 起点，三组 token 已存在 |
 | 5k | 0.30 | 0.00 | 0.00 | spatial warmup 完成 |
@@ -569,8 +571,14 @@ loss 的课程变化，action loss 始终以 1.0 权重训练，旧教师也以�
 
 相邻节点间使用线性插值；5k 之后辅助权重总和固定为 0.30，避免教师数量增加时总辅助尺度
 从一份膨胀为三份。权重为零的 mapper 跳过计算，但对应 typed token 仍通过 action loss 更新。
+这里的表格列是代码实际使用的最终系数 alpha/beta/gamma。为了论文表达，也可以采用完全
+等价的因子化写法：教师总损失权重取 0.1，三路相对权重 sw、fw、pw 的总和取 3.0，并令
+`alpha = 0.1 * sw`、`beta = 0.1 * fw`、`gamma = 0.1 * pw`。例如代码中的
+`(0.05, 0.10, 0.15)` 对应论文中的 `(sw, fw, pw) = (0.5, 1.0, 1.5)`。
+代码继续保存最终系数，因此历史 checkpoint、sidecar 和评测接口不需要迁移。
 每 1000 步额外记录各有效辅助目标相对 Qwen 最后一层 hidden 的加权梯度范数，以及其在对应
-typed-token 位置与 action 梯度的 cosine。第一版只做诊断，不自动应用 GradNorm/PCGrad。
+typed-token 位置与 action 梯度的 cosine。固定 progressive 入口只做诊断，不在该入口内自动
+应用 GradNorm/PCGrad；梯度均衡由下面的独立 GradNorm-style 入口负责。
 
 独立入口 `run_space2act_dwa_train.sh` 提供 `loss_schedule.mode=dwa` 自适应权重消融：前 5k 个 optimizer step
 只训练 action loss，之后在固定的 0.30 auxiliary budget 内，对相邻 optimizer-step 窗口的
@@ -578,8 +586,29 @@ EMA loss ratio 做 temperature-softmax 更新；`update_interval` 表示每个�
 而不是把相邻 batch 当作 ratio。DWA 的窗口累积、EMA、最近两次窗口 history、ratio、log-ratio
 和当前权重写入每个 checkpoint 旁的 `steps_N_adaptive.json`，恢复训练时一并加载。旧版
 sidecar 的相邻步状态不会直接混用，恢复模型后会从均分权重重新收集窗口。DWA 与 fixed
-knots 互斥；progressive 入口只运行 fixed knots 调度。PCGrad/GradNorm 暂不自动
-介入，只有梯度诊断显示稳定且显著的通道冲突时才进入后续消融。
+knots 互斥；progressive 入口只运行 fixed knots 调度。DWA 保留为基于 loss 窗口比值的粗粒度
+对照，不与下面的梯度均衡状态共享。
+DWA 同样可以用论文的因子化记法呈现：sidecar 中的三路有效系数除以 0.1，即得到
+`sw/fw/pw`；因此 DWA 的权重和 0.30 也对应相对权重和 3.0。
+为避免 loss 突然从均匀教师权重切换到 DWA，DWA 也支持可选的 cosine ramp；默认配置中
+`adaptive_weight_ramp_steps=0`，因此现有 DWA 启动脚本保持原行为，不启用该 ramp。
+
+独立入口 `run_space2act_gradnorm_train.sh` 提供 `loss_schedule.mode=gradnorm` 的第一版梯度均衡
+实验。它同样从第 0 步插入三组 S/F/P token，但前 5k 个 optimizer step 只反传 action loss；
+warmup 后的 20000 个 optimizer step 使用 cosine ramp，将均匀的三路 `0.10` 权重逐步过渡到
+GradNorm 权重；该参数只在 GradNorm 启动脚本中打开，DWA 脚本保持关闭。
+此后每 20 个 optimizer step 做一次 probe。probe 对每个未加权的通道 alignment loss，使用
+`torch.autograd.grad` 读取相对于 Qwen 最后一层 `last_hidden` 的完整张量梯度，并取全张量
+L2 范数；probe 只在梯度同步的 micro-batch 执行，三路标量先做 data-parallel 全局平均，再以
+0.9 的 EMA 平滑。每累计 200 个 optimizer step（正好 10 个 probe）在 optimizer.step() 完成后
+更新一次权重。对每个通道计算 `1 / max(EMA 梯度范数, epsilon)`，归一化到总 auxiliary budget
+0.30，再投影到单路 `[0.05, 0.20]` 的有界 simplex；因此实际参与总损失的梯度大小是“当前权重
+乘以 EMA 梯度范数”。在论文的因子化记法中，这个当前权重就是 `0.1 * sw/fw/pw`，而不是
+另一套独立参数。该入口固定 `alpha=0`，不引入第二个权重优化器，也不构造二阶梯度，
+所以它是 GradNorm 的轻量、可与 ZeRO-2 兼容的 style 实现，而不是论文中带可学习权重和
+relative-training-rate target 的完整变体。当前权重、EMA、最近一次 raw probe 和未完成窗口
+计数写入同一个 `steps_N_adaptive.json`，断点恢复后继续当前窗口。GradNorm 与 DWA/fixed knots
+互斥，三者使用独立启动脚本和独立状态模式。
 
 PCGrad 仍保留为独立研究分支，而不是被 AISER 否定。参数级 PCGrad 与 ZeRO-2 的分片梯度
 契约冲突较大，不作为首选实现；若长期日志同时出现显著负 gradient cosine 和 Action Success

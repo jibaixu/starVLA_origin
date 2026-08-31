@@ -27,8 +27,11 @@ from starVLA.model.modules.latent_reasoning import (
 from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
     QwenSpace2Act_GR00T,
     _normalize_dwa_config,
+    _normalize_gradnorm_config,
     _interpolate_loss_schedule,
     _normalize_loss_schedule,
+    _project_bounded_simplex,
+    _adaptive_weight_ramp_factor,
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 from tools.pack_teacher_latents import pack
@@ -566,6 +569,186 @@ class Space2ActTest(unittest.TestCase):
                 {"spatial"},
             )
 
+    def test_gradnorm_config_and_bounded_inverse_gradient_weights(self):
+        """GradNorm v1 validates its cadence and preserves the bounded budget."""
+        config = _normalize_gradnorm_config(
+            {
+                "mode": "gradnorm",
+                "enabled": True,
+                "alpha": 0.0,
+                "warmup_steps": 5,
+                "gradient_probe_interval": 2,
+                "gradient_update_interval": 4,
+                "gradient_ema_decay": 0.9,
+                "auxiliary_budget": 0.3,
+                "min_weight": 0.05,
+                "max_weight": 0.2,
+            },
+            {"spatial", "future", "plan"},
+        )
+        self.assertEqual(config["gradient_probe_interval"], 2)
+        self.assertEqual(config["gradient_update_interval"], 4)
+        self.assertEqual(config["alpha"], 0.0)
+        self.assertEqual(config["adaptive_weight_ramp_steps"], 0)
+
+        projected = _project_bounded_simplex(
+            {"spatial": 0.1714, "future": 0.0857, "plan": 0.0429},
+            total=0.3,
+            lower=0.05,
+            upper=0.2,
+        )
+        self.assertAlmostEqual(sum(projected.values()), 0.3, places=10)
+        self.assertTrue(all(0.05 <= value <= 0.2 for value in projected.values()))
+        self.assertAlmostEqual(projected["plan"], 0.05, places=8)
+
+        with self.assertRaisesRegex(ValueError, "only supports alpha=0"):
+            _normalize_gradnorm_config(
+                {"mode": "gradnorm", "enabled": True, "alpha": 0.5},
+                {"spatial", "future", "plan"},
+            )
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            _normalize_gradnorm_config(
+                {
+                    "mode": "gradnorm",
+                    "enabled": True,
+                    "gradient_probe_interval": 3,
+                    "gradient_update_interval": 4,
+                },
+                {"spatial", "future", "plan"},
+            )
+
+    def test_adaptive_weight_ramp_blends_dwa_and_gradnorm_weights(self):
+        """Cosine ramp preserves the budget while gradually trusting adaptive weights."""
+        self.assertAlmostEqual(_adaptive_weight_ramp_factor(5, 5, 20), 0.0, places=8)
+        self.assertAlmostEqual(_adaptive_weight_ramp_factor(15, 5, 20), 0.5, places=8)
+        self.assertAlmostEqual(_adaptive_weight_ramp_factor(25, 5, 20), 1.0, places=8)
+        self.assertAlmostEqual(_adaptive_weight_ramp_factor(6, 5, 0), 1.0, places=8)
+
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.gradnorm_enabled = True
+        framework.gradnorm_config = _normalize_gradnorm_config(
+            {
+                "mode": "gradnorm",
+                "enabled": True,
+                "warmup_steps": 5,
+                "adaptive_weight_ramp_steps": 20,
+                "auxiliary_budget": 0.3,
+                "min_weight": 0.05,
+                "max_weight": 0.2,
+            },
+            {"spatial", "future", "plan"},
+        )
+        framework.gradnorm_channels = ("spatial", "future", "plan")
+        framework.gradnorm_weights = {"spatial": 0.05, "future": 0.10, "plan": 0.15}
+
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 5),
+            {channel: 0.0 for channel in framework.gradnorm_channels},
+        )
+        midpoint = QwenSpace2Act_GR00T._effective_alignment_weights(framework, 15)
+        self.assertAlmostEqual(midpoint["spatial"], 0.075, places=8)
+        self.assertAlmostEqual(midpoint["future"], 0.10, places=8)
+        self.assertAlmostEqual(midpoint["plan"], 0.125, places=8)
+        self.assertAlmostEqual(sum(midpoint.values()), 0.3, places=8)
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 25),
+            framework.gradnorm_weights,
+        )
+
+        framework.gradnorm_enabled = False
+        framework.dwa_enabled = True
+        framework.dwa_config = _normalize_dwa_config(
+            {
+                "mode": "dwa",
+                "enabled": True,
+                "warmup_steps": 5,
+                "adaptive_weight_ramp_steps": 20,
+                "auxiliary_budget": 0.3,
+            },
+            {"spatial", "future", "plan"},
+        )
+        framework.dwa_channels = ("spatial", "future", "plan")
+        framework.dwa_weights = {"spatial": 0.15, "future": 0.10, "plan": 0.05}
+        midpoint = QwenSpace2Act_GR00T._effective_alignment_weights(framework, 15)
+        self.assertAlmostEqual(midpoint["spatial"], 0.125, places=8)
+        self.assertAlmostEqual(midpoint["future"], 0.10, places=8)
+        self.assertAlmostEqual(midpoint["plan"], 0.075, places=8)
+        self.assertAlmostEqual(sum(midpoint.values()), 0.3, places=8)
+
+    def test_gradnorm_probe_and_update_schedule(self):
+        """Probe every interval and update once the relative window is complete."""
+        config = _normalize_gradnorm_config(
+            {
+                "mode": "gradnorm",
+                "enabled": True,
+                "warmup_steps": 5,
+                "gradient_probe_interval": 2,
+                "gradient_update_interval": 4,
+                "gradient_ema_decay": 0.0,
+                "auxiliary_budget": 0.3,
+                "min_weight": 0.05,
+                "max_weight": 0.2,
+            },
+            {"spatial", "future", "plan"},
+        )
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.gradnorm_enabled = True
+        framework.gradnorm_config = config
+        framework.gradnorm_channels = ("spatial", "future", "plan")
+        framework.gradnorm_weights = {channel: 0.1 for channel in framework.gradnorm_channels}
+        framework.gradnorm_gradient_ema = {
+            channel: None for channel in framework.gradnorm_channels
+        }
+        framework.gradnorm_last_gradient_norm = {
+            channel: 0.0 for channel in framework.gradnorm_channels
+        }
+        framework.gradnorm_window_probes = 0
+
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 5),
+            {channel: 0.0 for channel in framework.gradnorm_channels},
+        )
+        self.assertEqual(
+            QwenSpace2Act_GR00T._effective_alignment_weights(framework, 6),
+            {channel: 0.1 for channel in framework.gradnorm_channels},
+        )
+        gradients = {
+            channel: torch.tensor(value)
+            for channel, value in {
+                "spatial": 1.0,
+                "future": 2.0,
+                "plan": 4.0,
+            }.items()
+        }
+        QwenSpace2Act_GR00T.update_adaptive_state(
+            framework, 7, channel_gradient_norms=gradients
+        )
+        self.assertEqual(framework.gradnorm_window_probes, 1)
+        metrics = QwenSpace2Act_GR00T.update_adaptive_state(
+            framework, 9, channel_gradient_norms=gradients
+        )
+        self.assertEqual(metrics["gradnorm_state_updated"], 1.0)
+        self.assertEqual(framework.gradnorm_window_probes, 0)
+        self.assertAlmostEqual(sum(framework.gradnorm_weights.values()), 0.3, places=8)
+        self.assertTrue(
+            all(0.05 <= value <= 0.2 for value in framework.gradnorm_weights.values())
+        )
+        self.assertGreater(framework.gradnorm_weights["spatial"], framework.gradnorm_weights["plan"])
+
+    def test_gradnorm_probe_reads_last_hidden_without_parameter_grads(self):
+        """Gradient probes use autograd.grad on last_hidden and return detached scalars."""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.gradnorm_channels = ("spatial", "future", "plan")
+        hidden = torch.randn(1, 6, 4, requires_grad=True)
+        losses = {
+            "spatial": hidden[:, 1:3].square().mean(),
+            "future": hidden[:, 3:5].square().mean(),
+            "plan": hidden[:, 0:2].square().mean(),
+        }
+        probes = QwenSpace2Act_GR00T._compute_gradnorm_probe(framework, hidden, losses)
+        self.assertEqual(set(probes), {f"gradnorm_probe/{channel}" for channel in framework.gradnorm_channels})
+        self.assertTrue(all(value.numel() == 1 and not value.requires_grad for value in probes.values()))
+
     def test_dwa_state_round_trip(self):
         """DWA runtime state is JSON-safe and restores its weights and history."""
         framework = object.__new__(QwenSpace2Act_GR00T)
@@ -603,6 +786,54 @@ class Space2ActTest(unittest.TestCase):
         self.assertEqual(restored.dwa_log_rate_initialized, framework.dwa_log_rate_initialized)
         self.assertEqual(restored.dwa_window_loss_sum, framework.dwa_window_loss_sum)
         self.assertEqual(restored.dwa_window_steps, framework.dwa_window_steps)
+
+    def test_gradnorm_state_round_trip(self):
+        """GradNorm EMA, raw probe and partial window state survive checkpoint restore."""
+        config = _normalize_gradnorm_config(
+            {
+                "mode": "gradnorm",
+                "enabled": True,
+                "warmup_steps": 5,
+                "gradient_probe_interval": 2,
+                "gradient_update_interval": 10,
+                "auxiliary_budget": 0.3,
+                "min_weight": 0.05,
+                "max_weight": 0.2,
+            },
+            {"spatial", "future", "plan"},
+        )
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.gradnorm_enabled = True
+        framework.gradnorm_config = config
+        framework.gradnorm_channels = ("spatial", "future", "plan")
+        framework.gradnorm_weights = {"spatial": 0.08, "future": 0.10, "plan": 0.12}
+        framework.gradnorm_gradient_ema = {
+            "spatial": 1.25,
+            "future": 0.75,
+            "plan": 2.5,
+        }
+        framework.gradnorm_last_gradient_norm = {
+            "spatial": 1.5,
+            "future": 0.5,
+            "plan": 3.0,
+        }
+        framework.gradnorm_window_probes = 3
+        state = QwenSpace2Act_GR00T.get_adaptive_state(framework)
+
+        restored = object.__new__(QwenSpace2Act_GR00T)
+        restored.gradnorm_enabled = True
+        restored.gradnorm_config = config
+        restored.gradnorm_channels = framework.gradnorm_channels
+        restored.gradnorm_weights = {channel: 0.1 for channel in restored.gradnorm_channels}
+        restored.gradnorm_gradient_ema = {channel: None for channel in restored.gradnorm_channels}
+        restored.gradnorm_last_gradient_norm = {channel: 0.0 for channel in restored.gradnorm_channels}
+        restored.gradnorm_window_probes = 0
+        QwenSpace2Act_GR00T.set_adaptive_state(restored, state)
+
+        self.assertEqual(restored.gradnorm_weights, framework.gradnorm_weights)
+        self.assertEqual(restored.gradnorm_gradient_ema, framework.gradnorm_gradient_ema)
+        self.assertEqual(restored.gradnorm_last_gradient_norm, framework.gradnorm_last_gradient_norm)
+        self.assertEqual(restored.gradnorm_window_probes, framework.gradnorm_window_probes)
 
     def test_hidden_gradient_diagnostics_do_not_accumulate_parameter_grads(self):
         """诊断使用 autograd.grad 读取 hidden 梯度，不应提前写入正常 backward 梯度。"""
@@ -1115,6 +1346,44 @@ class Space2ActTest(unittest.TestCase):
         self.assertIn("--framework.latent_reasoning.loss_schedule.auxiliary_budget 0.30", result.stdout)
         self.assertIn("--run_id space2act_libero_dwa_sfp_100k", result.stdout)
         self.assertNotIn("LOSS_SCHEDULE_MODE", source)
+        self.assertNotIn("progressive_sfp", source)
+        self.assertNotIn("adaptive_weight_ramp_steps", source)
+
+    def test_gradnorm_training_shell_has_dedicated_contract(self):
+        """GradNorm 入口固定使用 alpha=0、20/200 cadence 和有界预算。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        path = repo_root / "examples/simBenchmarks/LIBERO/train_files/run_space2act_gradnorm_train.sh"
+        source = path.read_text()
+        dry_run_source = source.replace('DRY_RUN="0"', 'DRY_RUN="1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "gradnorm.sh"
+            script.write_text(dry_run_source)
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.mode gradnorm", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.enabled true", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.knots \\[\\]", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.warmup_steps 5000", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.gradient_probe_interval 20", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.gradient_update_interval 200", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.gradient_ema_decay 0.9", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.alpha 0.0", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.auxiliary_budget 0.30", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.min_weight 0.05", result.stdout)
+        self.assertIn("--framework.latent_reasoning.loss_schedule.max_weight 0.20", result.stdout)
+        self.assertIn(
+            "--framework.latent_reasoning.loss_schedule.adaptive_weight_ramp_steps 20000",
+            result.stdout,
+        )
+        self.assertIn("--run_id space2act_libero_gradnorm_sfp_100k", result.stdout)
         self.assertNotIn("progressive_sfp", source)
 
     def test_evidence_routing_shell_enables_only_aiser_experiment(self):

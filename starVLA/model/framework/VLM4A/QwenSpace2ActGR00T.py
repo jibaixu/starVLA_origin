@@ -34,7 +34,7 @@ def _normalize_loss_schedule(schedule_cfg, active_channels) -> tuple[tuple[int, 
     """校验 progressive knots，并转换为只含 Python 标量的不可变结构。"""
     if not schedule_cfg or not _is_enabled(schedule_cfg.get("enabled", False)):
         return ()
-    if str(schedule_cfg.get("mode", "fixed")).lower() == "dwa":
+    if str(schedule_cfg.get("mode", "fixed")).lower() in ("dwa", "gradnorm"):
         return ()
 
     expected_channels = set(_SPACE2ACT_CHANNELS)
@@ -126,6 +126,9 @@ def _normalize_dwa_config(schedule_cfg, active_channels) -> dict[str, float | in
     warmup_steps = schedule_cfg.get("warmup_steps", 5000)
     if isinstance(warmup_steps, bool) or int(warmup_steps) != float(warmup_steps) or int(warmup_steps) < 0:
         raise ValueError("DWA warmup_steps must be a non-negative integer")
+    ramp_steps = schedule_cfg.get("adaptive_weight_ramp_steps", 0)
+    if isinstance(ramp_steps, bool) or int(ramp_steps) != float(ramp_steps) or int(ramp_steps) < 0:
+        raise ValueError("DWA adaptive_weight_ramp_steps must be a non-negative integer")
 
     return {
         "enabled": True,
@@ -135,7 +138,139 @@ def _normalize_dwa_config(schedule_cfg, active_channels) -> dict[str, float | in
         "ema_decay": finite_float("ema_decay", 0.5, 0.0, 1.0),
         "update_interval": int(interval),
         "warmup_steps": int(warmup_steps),
+        "adaptive_weight_ramp_steps": int(ramp_steps),
     }
+
+
+def _normalize_gradnorm_config(schedule_cfg, active_channels) -> dict[str, float | int | bool]:
+    """Validate the last-hidden gradient-balanced loss schedule configuration."""
+    mode = str(schedule_cfg.get("mode", "fixed")).lower() if schedule_cfg else "fixed"
+    if mode != "gradnorm":
+        return {"enabled": False, "mode": mode}
+    if not _is_enabled(schedule_cfg.get("enabled", False)):
+        raise ValueError("GradNorm loss_schedule requires enabled=true")
+    channels = tuple(active_channels)
+    if not channels:
+        raise ValueError("GradNorm loss_schedule requires at least one alignment channel")
+    if set(channels) != set(_SPACE2ACT_CHANNELS):
+        raise ValueError(
+            "GradNorm loss_schedule requires spatial/future/plan alignment channels"
+        )
+    if schedule_cfg.get("knots"):
+        raise ValueError("GradNorm loss_schedule cannot define fixed knots")
+
+    def finite_float(
+        name: str, default: float, minimum: float, maximum: float | None = None
+    ) -> float:
+        value = float(schedule_cfg.get(name, default))
+        if not math.isfinite(value) or value < minimum or (maximum is not None and value > maximum):
+            upper = f" and <= {maximum}" if maximum is not None else ""
+            raise ValueError(f"GradNorm {name} must be finite, >= {minimum}{upper}")
+        return value
+
+    def positive_int(name: str, default: int) -> int:
+        value = schedule_cfg.get(name, default)
+        if isinstance(value, bool) or int(value) != float(value) or int(value) <= 0:
+            raise ValueError(f"GradNorm {name} must be a positive integer")
+        return int(value)
+
+    probe_interval = positive_int("gradient_probe_interval", 20)
+    update_interval = positive_int("gradient_update_interval", 200)
+    if update_interval % probe_interval:
+        raise ValueError(
+            "GradNorm gradient_update_interval must be divisible by gradient_probe_interval"
+        )
+    warmup_steps = schedule_cfg.get("warmup_steps", 5000)
+    if (
+        isinstance(warmup_steps, bool)
+        or int(warmup_steps) != float(warmup_steps)
+        or int(warmup_steps) < 0
+    ):
+        raise ValueError("GradNorm warmup_steps must be a non-negative integer")
+    ramp_steps = schedule_cfg.get("adaptive_weight_ramp_steps", 0)
+    if isinstance(ramp_steps, bool) or int(ramp_steps) != float(ramp_steps) or int(ramp_steps) < 0:
+        raise ValueError("GradNorm adaptive_weight_ramp_steps must be a non-negative integer")
+
+    alpha = finite_float("alpha", 0.0, 0.0)
+    if not math.isclose(alpha, 0.0, abs_tol=1e-12):
+        raise ValueError("This GradNorm implementation only supports alpha=0")
+    budget = finite_float("auxiliary_budget", 0.30, 0.0)
+    min_weight = finite_float("min_weight", 0.05, 0.0)
+    max_weight = finite_float("max_weight", 0.20, min_weight)
+    if budget < len(channels) * min_weight or budget > len(channels) * max_weight:
+        raise ValueError(
+            "GradNorm auxiliary_budget must be feasible under min_weight/max_weight"
+        )
+
+    return {
+        "enabled": True,
+        "mode": "gradnorm",
+        "alpha": alpha,
+        "auxiliary_budget": budget,
+        "min_weight": min_weight,
+        "max_weight": max_weight,
+        "gradient_epsilon": finite_float("gradient_epsilon", 1e-8, 1e-12),
+        "gradient_ema_decay": finite_float("gradient_ema_decay", 0.9, 0.0, 1.0),
+        "gradient_probe_interval": probe_interval,
+        "gradient_update_interval": update_interval,
+        "warmup_steps": int(warmup_steps),
+        "adaptive_weight_ramp_steps": int(ramp_steps),
+    }
+
+
+def _project_bounded_simplex(
+    values: dict[str, float], total: float, lower: float, upper: float
+) -> dict[str, float]:
+    """Project values onto a box-constrained simplex using a scalar water level."""
+    channels = tuple(values)
+    if not channels:
+        return {}
+    if lower < 0.0 or upper < lower:
+        raise ValueError("Invalid bounded-simplex limits")
+    if total < len(channels) * lower or total > len(channels) * upper:
+        raise ValueError("Simplex total is infeasible under the supplied bounds")
+    if any(not math.isfinite(value) for value in values.values()):
+        raise ValueError("Simplex values must be finite")
+
+    raw = torch.tensor([float(values[channel]) for channel in channels], dtype=torch.float64)
+    low = float(raw.min().item()) - upper
+    high = float(raw.max().item()) - lower
+    for _ in range(80):
+        shift = (low + high) * 0.5
+        projected = raw.sub(shift).clamp(min=lower, max=upper)
+        if float(projected.sum().item()) > total:
+            low = shift
+        else:
+            high = shift
+    projected = raw.sub((low + high) * 0.5).clamp(min=lower, max=upper)
+
+    # Bisection leaves only floating-point roundoff. Correct the residual on a
+    # non-saturated coordinate so serialized weights preserve the budget.
+    residual = total - float(projected.sum().item())
+    if abs(residual) > 1e-12:
+        for index, value in enumerate(projected.tolist()):
+            room = (upper - value) if residual > 0.0 else (value - lower)
+            delta = math.copysign(min(abs(residual), max(room, 0.0)), residual)
+            projected[index] += delta
+            residual -= delta
+            if abs(residual) <= 1e-12:
+                break
+    return {channel: float(projected[index].item()) for index, channel in enumerate(channels)}
+
+
+def _adaptive_weight_ramp_factor(
+    training_step: int, warmup_steps: int, ramp_steps: int
+) -> float:
+    """Return the cosine trust factor for an adaptive weighting controller."""
+    if ramp_steps <= 0:
+        raise ValueError("ramp_steps must be a positive integer.")
+    if training_step <= warmup_steps:
+        return 0.0
+        
+    progress = (training_step - warmup_steps) / ramp_steps
+    if progress >= 1.0:
+        return 1.0
+    return 0.5 * (1.0 - math.cos(math.pi * progress))
 
 
 def _channel_defaults(token_enabled: bool, alignment_enabled: bool, target_tokens, target_dim):
@@ -182,6 +317,14 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
                 "temperature": 0.5,
                 "ema_decay": 0.5,
                 "update_interval": 500,
+                "alpha": 0.0,
+                "gradient_probe_interval": 20,
+                "gradient_update_interval": 200,
+                "gradient_ema_decay": 0.9,
+                "gradient_epsilon": 1e-8,
+                "min_weight": 0.05,
+                "max_weight": 0.20,
+                "adaptive_weight_ramp_steps": 0,
                 "knots": [],
             },
             "channels": {
@@ -292,7 +435,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
 
         schedule_cfg = latent_cfg.get("loss_schedule", {})
         schedule_mode = str(schedule_cfg.get("mode", "fixed")).lower()
-        if schedule_mode not in ("fixed", "dwa"):
+        if schedule_mode not in ("fixed", "dwa", "gradnorm"):
             raise ValueError(f"Unsupported Space2Act loss_schedule mode: {schedule_mode}")
         self.loss_schedule_knots = _normalize_loss_schedule(
             schedule_cfg, self.alignment_heads.keys()
@@ -300,7 +443,12 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         self.loss_schedule_enabled = bool(self.loss_schedule_knots)
         self.dwa_config = _normalize_dwa_config(schedule_cfg, self.alignment_heads.keys())
         self.dwa_enabled = bool(self.dwa_config["enabled"])
+        self.gradnorm_config = _normalize_gradnorm_config(
+            schedule_cfg, self.alignment_heads.keys()
+        )
+        self.gradnorm_enabled = bool(self.gradnorm_config["enabled"])
         self.dwa_channels = tuple(self.alignment_heads.keys())
+        self.gradnorm_channels = tuple(self.alignment_heads.keys())
         initial_weight = (
             float(self.dwa_config.get("auxiliary_budget", 0.0)) / len(self.dwa_channels)
             if self.dwa_channels
@@ -318,6 +466,20 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             channel: 0.0 for channel in self.dwa_channels
         }
         self.dwa_window_steps = 0
+        gradnorm_budget = float(self.gradnorm_config.get("auxiliary_budget", 0.0))
+        gradnorm_initial_weight = (
+            gradnorm_budget / len(self.gradnorm_channels) if self.gradnorm_channels else 0.0
+        )
+        self.gradnorm_weights = {
+            channel: gradnorm_initial_weight for channel in self.gradnorm_channels
+        }
+        self.gradnorm_gradient_ema: dict[str, float | None] = {
+            channel: None for channel in self.gradnorm_channels
+        }
+        self.gradnorm_last_gradient_norm: dict[str, float] = {
+            channel: 0.0 for channel in self.gradnorm_channels
+        }
+        self.gradnorm_window_probes = 0
         self.loss_diagnostic_interval = int(schedule_cfg.get("diagnostic_interval", 0))
         if self.loss_diagnostic_interval < 0:
             raise ValueError("loss_schedule diagnostic_interval must be non-negative")
@@ -434,19 +596,198 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         metrics["evidence_router/auxiliary_loss"] = auxiliary_loss
         return routed_hidden, routed_mask, metrics
 
+    def _blend_adaptive_alignment_weights(
+        self,
+        training_step: int,
+        adaptive_weights: dict[str, float],
+        adaptive_config: dict[str, float | int | bool],
+        channels: tuple[str, ...],
+    ) -> dict[str, float]:
+        warmup_steps = int(adaptive_config["warmup_steps"])
+        if int(training_step) <= warmup_steps:
+            return {channel: 0.0 for channel in channels}
+        budget = float(adaptive_config["auxiliary_budget"])
+        uniform_weight = budget / len(channels) if channels else 0.0
+        ramp_factor = _adaptive_weight_ramp_factor(
+            training_step,
+            warmup_steps,
+            int(adaptive_config.get("adaptive_weight_ramp_steps", 0)),
+        )
+        return {
+            channel: (1.0 - ramp_factor) * uniform_weight
+            + ramp_factor * float(adaptive_weights[channel])
+            for channel in channels
+        }
+
+    def _adaptive_weight_ramp(self, training_step: int, config: dict) -> float:
+        return _adaptive_weight_ramp_factor(
+            training_step,
+            int(config["warmup_steps"]),
+            int(config.get("adaptive_weight_ramp_steps", 0)),
+        )
+
     def _effective_alignment_weights(self, training_step: int | None) -> dict[str, float]:
+        if getattr(self, "gradnorm_enabled", False):
+            if training_step is None:
+                raise ValueError("training_step is required when Space2Act GradNorm is enabled")
+            return self._blend_adaptive_alignment_weights(
+                int(training_step),
+                self.gradnorm_weights,
+                self.gradnorm_config,
+                self.gradnorm_channels,
+            )
         if getattr(self, "dwa_enabled", False):
             if training_step is None:
                 raise ValueError("training_step is required when Space2Act DWA is enabled")
-            step = int(training_step)
-            if step <= int(self.dwa_config["warmup_steps"]):
-                return {channel: 0.0 for channel in self.dwa_channels}
-            return dict(self.dwa_weights)
+            return self._blend_adaptive_alignment_weights(
+                int(training_step),
+                self.dwa_weights,
+                self.dwa_config,
+                self.dwa_channels,
+            )
         if not getattr(self, "loss_schedule_enabled", False):
             return dict(self.alignment_loss_weights)
         if training_step is None:
             raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
         return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
+
+    def _compute_gradnorm_probe(
+        self, last_hidden: torch.Tensor, channel_losses: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Measure each unweighted teacher gradient on the shared last hidden state."""
+        probes = {}
+        for channel in self.gradnorm_channels:
+            gradient = torch.autograd.grad(
+                channel_losses[channel],
+                last_hidden,
+                retain_graph=True,
+                create_graph=False,
+            )[0]
+            probes[f"gradnorm_probe/{channel}"] = torch.linalg.vector_norm(
+                gradient.detach().float()
+            )
+        return probes
+
+    def _gradnorm_balance_error(self) -> float:
+        """Return max/min weighted gradient norm for the current EMA values."""
+        weighted = [
+            self.gradnorm_weights[channel] * float(self.gradnorm_gradient_ema[channel])
+            for channel in self.gradnorm_channels
+            if self.gradnorm_gradient_ema[channel] is not None
+        ]
+        if len(weighted) != len(self.gradnorm_channels):
+            return 0.0
+        minimum = min(weighted)
+        if minimum <= 1e-12:
+            return 0.0
+        return max(weighted) / minimum
+
+    def _gradnorm_metrics(
+        self, reference: torch.Tensor, updated: bool, training_step: int
+    ) -> dict[str, torch.Tensor]:
+        metrics = {
+            "gradnorm_state_updated": reference.new_tensor(float(updated), dtype=torch.float32),
+            "gradnorm_weight_sum": reference.new_tensor(
+                sum(self.gradnorm_weights.values()), dtype=torch.float32
+            ),
+            "gradnorm_ready": reference.new_tensor(
+                float(all(self.gradnorm_gradient_ema[channel] is not None for channel in self.gradnorm_channels)),
+                dtype=torch.float32,
+            ),
+            "gradnorm_window_probes": reference.new_tensor(
+                float(self.gradnorm_window_probes), dtype=torch.float32
+            ),
+            "gradnorm_balance_error": reference.new_tensor(
+                self._gradnorm_balance_error(), dtype=torch.float32
+            ),
+            "gradnorm/ramp_factor": reference.new_tensor(
+                self._adaptive_weight_ramp(training_step, self.gradnorm_config), dtype=torch.float32
+            ),
+        }
+        for channel in self.gradnorm_channels:
+            gradient_ema = self.gradnorm_gradient_ema[channel]
+            gradient_norm = float(gradient_ema) if gradient_ema is not None else 0.0
+            weight = self.gradnorm_weights[channel]
+            metrics[f"gradnorm/ema_gradient_norm/{channel}"] = reference.new_tensor(
+                gradient_norm, dtype=torch.float32
+            )
+            metrics[f"gradnorm/weight/{channel}"] = reference.new_tensor(
+                weight, dtype=torch.float32
+            )
+            metrics[f"gradnorm/weighted_gradient_norm/{channel}"] = reference.new_tensor(
+                weight * gradient_norm, dtype=torch.float32
+            )
+        return metrics
+
+    def _update_gradnorm_state(
+        self,
+        training_step: int,
+        channel_gradient_norms: dict[str, torch.Tensor],
+        should_update: bool,
+    ) -> bool:
+        """Update alpha=0 inverse-gradient weights at a fixed optimizer-step cadence."""
+        if not self.gradnorm_enabled or not should_update:
+            return False
+        step = int(training_step)
+        warmup_steps = int(self.gradnorm_config["warmup_steps"])
+        if step <= warmup_steps:
+            return False
+
+        if channel_gradient_norms:
+            if any(channel not in channel_gradient_norms for channel in self.gradnorm_channels):
+                return False
+            gradient_values = torch.stack(
+                [channel_gradient_norms[channel].detach().float() for channel in self.gradnorm_channels]
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(gradient_values, op=dist.ReduceOp.SUM)
+                gradient_values.div_(dist.get_world_size())
+            for index, channel in enumerate(self.gradnorm_channels):
+                gradient_norm = float(gradient_values[index].item())
+                if not math.isfinite(gradient_norm) or gradient_norm < 0.0:
+                    raise ValueError(
+                        f"GradNorm gradient norm for channel '{channel}' must be finite and non-negative"
+                    )
+                previous = self.gradnorm_gradient_ema[channel]
+                decay = float(self.gradnorm_config["gradient_ema_decay"])
+                self.gradnorm_gradient_ema[channel] = (
+                    gradient_norm
+                    if previous is None
+                    else decay * previous + (1.0 - decay) * gradient_norm
+                )
+                self.gradnorm_last_gradient_norm[channel] = gradient_norm
+            self.gradnorm_window_probes += 1
+
+        interval = int(self.gradnorm_config["gradient_update_interval"])
+        if (step - warmup_steps) % interval != 0:
+            return False
+
+        expected_probes = interval // int(self.gradnorm_config["gradient_probe_interval"])
+        window_valid = self.gradnorm_window_probes == expected_probes and all(
+            self.gradnorm_gradient_ema[channel] is not None for channel in self.gradnorm_channels
+        )
+        self.gradnorm_window_probes = 0
+        if not window_valid:
+            return False
+
+        epsilon = float(self.gradnorm_config["gradient_epsilon"])
+        inverse_norms = {
+            channel: 1.0 / max(float(self.gradnorm_gradient_ema[channel]), epsilon)
+            for channel in self.gradnorm_channels
+        }
+        inverse_sum = sum(inverse_norms.values())
+        budget = float(self.gradnorm_config["auxiliary_budget"])
+        targets = {
+            channel: budget * inverse_norms[channel] / inverse_sum
+            for channel in self.gradnorm_channels
+        }
+        self.gradnorm_weights = _project_bounded_simplex(
+            targets,
+            total=budget,
+            lower=float(self.gradnorm_config["min_weight"]),
+            upper=float(self.gradnorm_config["max_weight"]),
+        )
+        return True
 
     def _update_dwa_state(
         self,
@@ -540,14 +881,53 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         probabilities = [max(self.dwa_weights[channel] / budget, 0.0) for channel in self.dwa_channels]
         return float(-sum(probability * math.log(max(probability, 1e-12)) for probability in probabilities))
 
-    def update_adaptive_state(      #! 由外部训练主流程直接调用，然后触发 DWA 状态更新
+    def update_adaptive_state(      #! 由外部训练主流程直接调用，然后触发自适应状态更新
         self,
         training_step: int,
-        channel_losses: dict[str, torch.Tensor],
+        channel_losses: dict[str, torch.Tensor] | None = None,
         should_update: bool = True,
+        channel_gradient_norms: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, float]:
-        """Advance DWA state at an optimizer-step boundary."""
-        #! _update_dwa_state内部会进行非dwa模式拦截
+        """Advance DWA or GradNorm state at an optimizer-step boundary."""
+        channel_losses = channel_losses or {}
+        channel_gradient_norms = channel_gradient_norms or {}
+        if getattr(self, "gradnorm_enabled", False):
+            previous_weights = dict(self.gradnorm_weights)
+            updated = self._update_gradnorm_state(
+                training_step, channel_gradient_norms, should_update
+            )
+            metrics = {
+                "gradnorm_state_updated": float(updated),
+                "gradnorm_weight_sum": float(sum(self.gradnorm_weights.values())),
+                "gradnorm_ready": float(
+                    all(
+                        self.gradnorm_gradient_ema[channel] is not None
+                        for channel in self.gradnorm_channels
+                    )
+                ),
+                "gradnorm_window_probes": float(self.gradnorm_window_probes),
+                "gradnorm_balance_error": self._gradnorm_balance_error(),
+                "gradnorm/ramp_factor": self._adaptive_weight_ramp(
+                    training_step, self.gradnorm_config
+                ),
+            }
+            for channel in self.gradnorm_channels:
+                gradient_ema = self.gradnorm_gradient_ema[channel]
+                gradient_norm = float(gradient_ema) if gradient_ema is not None else 0.0
+                metrics[f"gradnorm/ema_gradient_norm/{channel}"] = gradient_norm
+                metrics[f"gradnorm/raw_gradient_norm/{channel}"] = float(
+                    self.gradnorm_last_gradient_norm[channel]
+                )
+                metrics[f"gradnorm/weight/{channel}"] = float(self.gradnorm_weights[channel])
+                metrics[f"gradnorm/weight_delta/{channel}"] = float(
+                    self.gradnorm_weights[channel] - previous_weights[channel]
+                )
+                metrics[f"gradnorm/weighted_gradient_norm/{channel}"] = float(
+                    self.gradnorm_weights[channel] * gradient_norm
+                )
+            return metrics
+
+        # Keep the original DWA runtime contract unchanged for existing runs.
         previous_weights = dict(self.dwa_weights)
         updated = self._update_dwa_state(training_step, channel_losses, should_update)
         metrics = {
@@ -558,6 +938,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             ),
             "dwa_window_steps": float(self.dwa_window_steps),
             "dwa_weight_entropy": self._dwa_weight_entropy(),
+            "dwa/ramp_factor": self._adaptive_weight_ramp(training_step, self.dwa_config),
         }
         for channel in self.dwa_channels:
             metrics[f"dwa_loss_ema/{channel}"] = float(self.dwa_loss_ema[channel] or 0.0)
@@ -570,7 +951,17 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         return metrics
 
     def get_adaptive_state(self) -> dict:
-        """Return JSON-safe non-parameter state needed to resume DWA exactly."""
+        """Return JSON-safe non-parameter state needed to resume adaptive weighting."""
+        if getattr(self, "gradnorm_enabled", False):
+            return {
+                "mode": "gradnorm",
+                "state_version": 1,
+                "channels": list(self.gradnorm_channels),
+                "weights": dict(self.gradnorm_weights),
+                "gradient_ema": dict(self.gradnorm_gradient_ema),
+                "last_gradient_norm": dict(self.gradnorm_last_gradient_norm),
+                "window_probes": int(self.gradnorm_window_probes),
+            }
         if not self.dwa_enabled:
             return {"mode": "fixed"}
         return {
@@ -588,7 +979,52 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         }
 
     def set_adaptive_state(self, state: dict | None) -> None:
-        """Restore DWA state from a checkpoint sidecar, if this run uses DWA."""
+        """Restore adaptive weighting state from a checkpoint sidecar."""
+        if getattr(self, "gradnorm_enabled", False):
+            if not state:
+                return
+            if state.get("mode") != "gradnorm":
+                raise ValueError("GradNorm checkpoint sidecar has an incompatible mode")
+            if tuple(state.get("channels", ())) != self.gradnorm_channels:
+                raise ValueError("GradNorm checkpoint channels do not match the current model")
+            for channel in self.gradnorm_channels:
+                ema = state.get("gradient_ema", {}).get(channel, None)
+                self.gradnorm_gradient_ema[channel] = None if ema is None else float(ema)
+                self.gradnorm_last_gradient_norm[channel] = float(
+                    state.get("last_gradient_norm", {}).get(channel, 0.0)
+                )
+                weight = float(
+                    state.get("weights", {}).get(channel, self.gradnorm_weights[channel])
+                )
+                if self.gradnorm_gradient_ema[channel] is not None and (
+                    not math.isfinite(self.gradnorm_gradient_ema[channel])
+                    or self.gradnorm_gradient_ema[channel] < 0.0
+                ):
+                    raise ValueError(f"Invalid GradNorm EMA for channel '{channel}'")
+                if (
+                    not math.isfinite(self.gradnorm_last_gradient_norm[channel])
+                    or self.gradnorm_last_gradient_norm[channel] < 0.0
+                ):
+                    raise ValueError(f"Invalid GradNorm gradient norm for channel '{channel}'")
+                if not math.isfinite(weight):
+                    raise ValueError(f"Invalid GradNorm weight for channel '{channel}'")
+                self.gradnorm_weights[channel] = weight
+            self.gradnorm_window_probes = int(state.get("window_probes", 0))
+            expected_probes = int(self.gradnorm_config["gradient_update_interval"]) // int(
+                self.gradnorm_config["gradient_probe_interval"]
+            )
+            if self.gradnorm_window_probes < 0 or self.gradnorm_window_probes >= expected_probes:
+                raise ValueError("Invalid GradNorm window_probes in checkpoint")
+            minimum = float(self.gradnorm_config["min_weight"])
+            maximum = float(self.gradnorm_config["max_weight"])
+            budget = float(self.gradnorm_config["auxiliary_budget"])
+            if any(
+                weight < minimum or weight > maximum for weight in self.gradnorm_weights.values()
+            ):
+                raise ValueError("GradNorm checkpoint weights violate configured bounds")
+            if not math.isclose(sum(self.gradnorm_weights.values()), budget, rel_tol=1e-5, abs_tol=1e-7):
+                raise ValueError("GradNorm checkpoint weights do not preserve auxiliary_budget")
+            return
         if not self.dwa_enabled or not state or state.get("mode") != "dwa":
             return
         if tuple(state.get("channels", ())) != self.dwa_channels:
@@ -646,7 +1082,9 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if not math.isclose(sum(self.dwa_weights.values()), budget, rel_tol=1e-5, abs_tol=1e-7):
             raise ValueError("DWA checkpoint weights do not preserve auxiliary_budget")
 
-    def _dwa_metrics(self, reference: torch.Tensor, updated: bool) -> dict[str, torch.Tensor]:
+    def _dwa_metrics(
+        self, reference: torch.Tensor, updated: bool, training_step: int
+    ) -> dict[str, torch.Tensor]:
         metrics = {
             "dwa_state_updated": reference.new_tensor(float(updated), dtype=torch.float32),
             "dwa_weight_sum": reference.new_tensor(sum(self.dwa_weights.values()), dtype=torch.float32),
@@ -656,6 +1094,9 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             ),
             "dwa_window_steps": reference.new_tensor(float(self.dwa_window_steps), dtype=torch.float32),
             "dwa_weight_entropy": reference.new_tensor(self._dwa_weight_entropy(), dtype=torch.float32),
+            "dwa/ramp_factor": reference.new_tensor(
+                self._adaptive_weight_ramp(training_step, self.dwa_config), dtype=torch.float32
+            ),
         }
         for channel in self.dwa_channels:
             metrics[f"dwa_loss_ema/{channel}"] = reference.new_tensor(
@@ -722,6 +1163,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
         training_step = kwargs.pop("training_step", None)
         run_gradient_diagnostics = kwargs.pop("run_gradient_diagnostics", True)
+        run_gradient_probe = kwargs.pop("run_gradient_probe", False)
         effective_weights = self._effective_alignment_weights(training_step)
         # 先保持基础 QwenGR00T 的样本字段约定，再额外读取 dataloader 注入的 teacher。
         batch_images = [example["image"] for example in examples]
@@ -753,7 +1195,9 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             losses[f"{channel}_alignment_weight"] = last_hidden.new_tensor(
                 weight, dtype=torch.float32
             )
-            active = not (self.loss_schedule_enabled or self.dwa_enabled) or weight > 0.0
+            active = not (
+                self.loss_schedule_enabled or self.dwa_enabled or self.gradnorm_enabled
+            ) or weight > 0.0
             losses[f"{channel}_alignment_active"] = last_hidden.new_tensor(
                 float(active), dtype=torch.float32
             )
@@ -817,9 +1261,11 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                 action_hidden, action_target, state_repeated, encoder_attention_mask=action_mask
             )
 
-        if self.loss_schedule_enabled or self.dwa_enabled:
+        if self.loss_schedule_enabled or self.dwa_enabled or self.gradnorm_enabled:
             if self.dwa_enabled:
-                losses.update(self._dwa_metrics(last_hidden, False))
+                losses.update(self._dwa_metrics(last_hidden, False, int(training_step)))
+            if self.gradnorm_enabled:
+                losses.update(self._gradnorm_metrics(last_hidden, False, int(training_step)))
             if self.loss_schedule_enabled:
                 steps = [step for step, _ in self.loss_schedule_knots]
                 segment = max(0, min(bisect_right(steps, int(training_step)) - 1, len(steps) - 1))
@@ -845,6 +1291,21 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
                         effective_weights,
                     )
                 )
+            should_probe = (
+                bool(run_gradient_probe)
+                and self.gradnorm_enabled
+                and int(training_step) > int(self.gradnorm_config["warmup_steps"])
+                and (int(training_step) - int(self.gradnorm_config["warmup_steps"])) % int(
+                    self.gradnorm_config["gradient_probe_interval"]
+                )
+                == 0
+                and bool(channel_losses)
+                and all(channel in channel_losses for channel in self.gradnorm_channels)
+                and torch.is_grad_enabled()
+                and last_hidden.requires_grad
+            )
+            if should_probe:
+                losses.update(self._compute_gradnorm_probe(last_hidden, channel_losses))
 
         # trainer 优先反传 total_loss；同时保留分项，便于独立观察 action 与各教师损失。
         losses["action_loss"] = action_loss

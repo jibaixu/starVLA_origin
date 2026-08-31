@@ -40,10 +40,15 @@ framework:
       entropy_loss_weight: 0.0001
       diversity_loss_weight: 0.001
     # 默认关闭以保持 legacy Stage 1/2/3 的固定 loss_weight 行为。独立 progressive
-    # 脚本开启后，三路权重在单次 100k optimizer 轨迹中按 knots 线性插值。
+    # 脚本开启后，三路有效系数在单次 100k optimizer 轨迹中按 knots 线性插值。
     loss_schedule:
-      # fixed 使用下方 knots；dwa 使用 loss-only Dynamic Weight Average。
-      # progressive 入口默认 fixed，切换为 dwa 才启用自适应权重。
+      # fixed 使用下方 knots；dwa 使用 loss-only Dynamic Weight Average；
+      # gradnorm 使用 last_hidden gradient probe 做三路梯度均衡。
+      # 代码内部保存的是最终有效系数 alpha/beta/gamma；论文中可等价写成
+      # teacher_loss_weight * (sw * spatial + fw * future + pw * plan)。
+      # 当 teacher_loss_weight=0.1 时，auxiliary_budget=0.30 等价于 sw+fw+pw=3。
+      # progressive 入口默认 fixed，切换为 dwa/gradnorm 才启用自适应权重。
+      # DWA/GradNorm 可用 adaptive_weight_ramp_steps 从均匀权重 cosine 过渡到自适应权重。
       mode: fixed
       enabled: false
       diagnostic_interval: 0
@@ -53,6 +58,16 @@ framework:
       temperature: 0.5
       ema_decay: 0.5
       update_interval: 500
+      alpha: 0.0
+      gradient_probe_interval: 20
+      gradient_update_interval: 200
+      gradient_ema_decay: 0.9
+      gradient_epsilon: 1.0e-8
+      min_weight: 0.05
+      max_weight: 0.20
+      # 0 保持原有 DWA/GradNorm 的直接切换；GradNorm 独立脚本覆盖为 20000，
+      # 在 warmup 后用 cosine ramp 逐步增加自适应权重的影响。
+      adaptive_weight_ramp_steps: 0
       knots:
         - step: 0
           weights: {spatial: 0.0, future: 0.0, plan: 0.0}
