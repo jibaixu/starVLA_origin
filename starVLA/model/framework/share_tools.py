@@ -22,6 +22,43 @@ from starVLA.training.trainer_utils import initialize_overwatch
 overwatch = initialize_overwatch(__name__)
 
 
+def load_config_with_base(config_path: str):
+    """Load a YAML config, optionally merging a relative ``base_config`` first.
+
+    This keeps stage-specific experiment configs small without adding Hydra as a
+    runtime dependency.  A child config always wins over its base config.
+    """
+    config_file = Path(config_path).resolve()
+    config = OmegaConf.load(config_file)
+    base_config = config.get("base_config", None)
+    remove_config_keys = list(config.get("remove_config_keys", []))
+    if "remove_config_keys" in config:
+        del config["remove_config_keys"]
+    if not base_config:
+        merged = config
+    else:
+        base_path = (config_file.parent / str(base_config)).resolve()
+        if not base_path.is_file():
+            raise FileNotFoundError(f"base_config does not exist: {base_path}")
+        base = load_config_with_base(str(base_path))
+        del config["base_config"]
+        merged = OmegaConf.merge(base, config)
+
+    for dotted_key in remove_config_keys:
+        if not isinstance(dotted_key, str) or not dotted_key:
+            raise ValueError("remove_config_keys entries must be non-empty dotted strings")
+        parent = merged
+        parts = dotted_key.split(".")
+        for part in parts[:-1]:
+            if part not in parent:
+                parent = None
+                break
+            parent = parent[part]
+        if parent is not None and parts[-1] in parent:
+            del parent[parts[-1]]
+    return merged
+
+
 class NamespaceWithGet(SimpleNamespace):
     def get(self, key, default=None):
         """

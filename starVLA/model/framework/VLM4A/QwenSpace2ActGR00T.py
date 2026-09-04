@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from omegaconf import OmegaConf
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.share_tools import merge_framework_config
@@ -339,49 +341,15 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
         default_factory=lambda: {
             "stage": 1,
             "routing_mode": "native_causal",
+            # Kept explicit because token order changes the causal computation and
+            # therefore must be checked when transferring a distilled VLM.
+            "token_order": "spatial_instruction_future_plan",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
             "confidence_aware_alignment": {
                 "enabled": False,
                 "min_weight": 0.0,
                 "require_cached_confidence": True,
-            },
-            "pcgrad": {
-                "enabled": False,
-                "trigger_cosine": -0.05,
-                "warmup_steps": 5000,
-                "epsilon": 1e-12,
-                "project_router": False,
-            },
-            "evidence_routing": {
-                "enabled": False,
-                "action_token_count": 8,
-                "router_dim": 512,
-                "num_heads": 8,
-                "gate_temperature": 1.0,
-                "replace_typed_tokens": True,
-                "budget_loss_weight": 0.001,
-                "entropy_loss_weight": 0.0001,
-                "diversity_loss_weight": 0.001,
-            },
-            "loss_schedule": {
-                "mode": "fixed",
-                "enabled": False,
-                "diagnostic_interval": 0,
-                "auxiliary_budget": 0.30,
-                "warmup_steps": 5000,
-                "temperature": 0.5,
-                "ema_decay": 0.5,
-                "update_interval": 500,
-                "alpha": 0.0,
-                "gradient_probe_interval": 20,
-                "gradient_update_interval": 200,
-                "gradient_ema_decay": 0.9,
-                "gradient_epsilon": 1e-8,
-                "min_weight": 0.05,
-                "max_weight": 0.20,
-                "adaptive_weight_ramp_steps": 0,
-                "knots": [],
             },
             "channels": {
                 "spatial": _channel_defaults(True, True, 1521, 5120),
@@ -435,6 +403,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             latent_cfg.channels,
             init_strategy=str(latent_cfg.token_init_strategy),
             action_token_count=action_token_count,
+            token_order=str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
         )
         hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
         self.evidence_router_loss_weights = {}
@@ -545,6 +514,59 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         self.loss_diagnostic_interval = int(schedule_cfg.get("diagnostic_interval", 0))
         if self.loss_diagnostic_interval < 0:
             raise ValueError("loss_schedule diagnostic_interval must be non-negative")
+
+    def space2act_layout(self) -> dict:
+        """Return the checkpoint-visible typed-token contract for stage transfer."""
+        latent_cfg = self.config.framework.latent_reasoning
+        return {
+            "base_vlm": str(self.config.framework.qwenvl.base_vlm),
+            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            "channels": {
+                channel: int(latent_cfg.channels[channel].token_count)
+                for channel in _SPACE2ACT_CHANNELS
+            },
+        }
+
+    def validate_pretrained_checkpoint(self, checkpoint_path, reload_modules=None) -> None:
+        """Reject an incompatible VLM-only checkpoint before partial Qwen loading."""
+        requested = {item.strip() for item in (reload_modules or "").split(",") if item.strip()}
+        if "qwen_vl_interface" not in requested:
+            return
+
+        checkpoint = Path(checkpoint_path).resolve()
+        config_candidates = (
+            checkpoint.parent / "config.full.yaml",
+            checkpoint.parent.parent / "config.full.yaml",
+        )
+        source_path = next((path for path in config_candidates if path.is_file()), None)
+        if source_path is None:
+            raise ValueError(
+                "VLM-only Space2Act transfer requires config.full.yaml next to the run output; "
+                f"none found for {checkpoint}"
+            )
+        source_cfg = OmegaConf.load(source_path)
+        source_framework = source_cfg.get("framework", {})
+        if source_framework.get("name") != "QwenSpace2ActVLM":
+            raise ValueError(
+                "Partial qwen_vl_interface loading is reserved for a QwenSpace2ActVLM "
+                f"distillation checkpoint, got {source_framework.get('name')!r}"
+            )
+
+        source_latent = source_framework.get("latent_reasoning", {})
+        expected = self.space2act_layout()
+        actual = {
+            "base_vlm": str(source_framework.get("qwenvl", {}).get("base_vlm", "")),
+            "token_order": str(source_latent.get("token_order", "spatial_instruction_future_plan")),
+            "channels": {
+                channel: int(source_latent.get("channels", {}).get(channel, {}).get("token_count", -1))
+                for channel in _SPACE2ACT_CHANNELS
+            },
+        }
+        if actual != expected:
+            raise ValueError(
+                "Incompatible Space2Act VLM checkpoint layout for action-head training: "
+                f"expected {expected}, got {actual}"
+            )
 
     @staticmethod
     def _token_positions(

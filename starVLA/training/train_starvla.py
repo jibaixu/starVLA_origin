@@ -186,7 +186,7 @@ from transformers import AutoProcessor, get_scheduler
 # Local Modules
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
-from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.model.framework.share_tools import apply_config_compat, load_config_with_base
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     )
     args, clipargs = parser.parse_known_args()
 
-    cfg = OmegaConf.load(args.config_yaml)
+    cfg = load_config_with_base(args.config_yaml)
     dotlist = normalize_dotlist_args(clipargs)
     cli_cfg = OmegaConf.from_dotlist(dotlist)
     cfg = OmegaConf.merge(cfg, cli_cfg)

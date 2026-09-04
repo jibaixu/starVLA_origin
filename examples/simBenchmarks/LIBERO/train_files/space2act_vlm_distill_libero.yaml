@@ -1,0 +1,198 @@
+# Self-contained VLM-only Space2Act distillation configuration.
+run_id: space2act_libero_vlm_distill_spf
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: jinhuiye
+wandb_project: starVLA_Libero
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenSpace2ActVLM
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  latent_reasoning:
+    routing_mode: native_causal
+    token_order: spatial_instruction_plan_future
+    token_init_strategy: avg
+    query_chunk_size: 128
+    confidence_aware_alignment:
+      enabled: false
+      min_weight: 0.0
+      require_cached_confidence: true
+    loss_schedule:
+      enabled: false
+      mode: fixed
+      knots: []
+    channels:
+      spatial:
+        token_enabled: true
+        token_count: 32
+        alignment_enabled: true
+        target_tokens: 1521
+        target_dim: 5120
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+      future:
+        token_enabled: true
+        token_count: 32
+        alignment_enabled: true
+        target_tokens: 1125
+        target_dim: 3072
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+      plan:
+        token_enabled: true
+        token_count: 32
+        alignment_enabled: true
+        target_tokens: 32
+        target_dim: 32
+        alignment_dim: 1024
+        num_heads: 8
+        loss_weight: 1.0
+        mse_weight: 0.1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_all
+    seed: 42
+    include_state: true
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    num_workers: 8
+    persistent_workers: true
+    mp_sharing_strategy: default
+    episode_indices: null
+    # Each channel uses episode safetensors by default. Set packed_relative_dir
+    # to a directory containing manifest.json + features.bin (and optional
+    # confidence.bin) to use the equivalent mmap-packed backend.
+    teacher_latents:
+      channels:
+        spatial:
+          enabled: ${framework.latent_reasoning.channels.spatial.alignment_enabled}
+          relative_dir: lingbot_latent_step4_numlayer24_stride16
+          packed_relative_dir: null
+          target_tokens: ${framework.latent_reasoning.channels.spatial.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.spatial.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          confidence_key: confidence
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
+          anchor_stride: 16
+          validate_episode_length: true
+          expected_metadata:
+            complete: "true"
+            layer: "24"
+            share_stride: "16"
+            spatial_tokens: "1521"
+            feature_dim: "5120"
+        future:
+          enabled: ${framework.latent_reasoning.channels.future.alignment_enabled}
+          relative_dir: wan2_2_future_latent_h16_step20_block20z_stride8_480x480
+          packed_relative_dir: null
+          target_tokens: ${framework.latent_reasoning.channels.future.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.future.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          confidence_key: confidence
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
+          anchor_stride: 8
+          validate_episode_length: true
+          expected_metadata:
+            complete: "true"
+            share_stride: "8"
+            block_index: "20"
+            block_indexing: zero_based
+            num_inference_steps: "20"
+            saved_denoise_step: "19"
+            saved_denoise_step_indexing: zero_based
+            cfg_branch: positive
+            target_tokens: "1125"
+            feature_dim: "3072"
+            temporal_tokens: "5"
+            token_h: "15"
+            token_w: "15"
+            token_order: temporal_height_width
+            dtype: bfloat16
+            height: "480"
+            width: "480"
+        plan:
+          enabled: ${framework.latent_reasoning.channels.plan.alignment_enabled}
+          relative_dir: moto_plan_latent_pre_vq_delta4x4_h16_stride1_epoch10
+          packed_relative_dir: null
+          target_tokens: ${framework.latent_reasoning.channels.plan.target_tokens}
+          target_dim: ${framework.latent_reasoning.channels.plan.target_dim}
+          feature_key: features
+          anchor_key: anchor_frames
+          confidence_key: confidence
+          feature_dtype: bfloat16
+          anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
+          anchor_stride: 1
+          validate_episode_length: true
+          expected_metadata:
+            complete: "true"
+            checkpoint_epoch: "10"
+            checkpoint_step: "4690"
+            checkpoint_sha256: 4d48688c53c8830da6c2f4899264771f8c4c00595d1462794964589efa09ff46
+            fps: "20"
+            video_key: observation.images.image
+            share_stride: "1"
+            segment_delta: "4"
+            segment_count: "4"
+            segment_offsets: "0:4,4:8,8:12,12:16"
+            future_horizon_frames: "16"
+            target_tokens: "32"
+            feature_dim: "32"
+            queries_per_segment: "8"
+            latent_type: pre_vq
+            token_order: segment_major_query_major
+            dtype: bfloat16
+            tail_padding: repeat_last_frame
+            preprocessor: mae_imagenet_bicubic_224_eval
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    alignment_heads: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs: {min_lr: 1.0e-06}
+  pretrained_checkpoint: ""
+  reload_modules: ""
+  freeze_modules: ""
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  save_format: pt
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

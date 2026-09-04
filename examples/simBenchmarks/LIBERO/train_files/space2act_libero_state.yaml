@@ -20,9 +20,10 @@ framework:
   latent_reasoning:
     # Stage 1/2/3 由启动脚本覆盖；写入 checkpoint config 后用于校验课程热启动。
     stage: 1
-    # 当前实现沿用 Qwen 原生因果掩码，物理顺序为：
-    # images -> S -> instruction -> F -> P；block mask 留作后续消融。
+    # 当前实现沿用 Qwen 原生因果掩码。旧端到端实验保留 F -> P 顺序；
+    # 两阶段蒸馏配置显式覆盖为 S -> instruction -> P -> F。
     routing_mode: native_causal
+    token_order: spatial_instruction_future_plan
     # avg 用现有词表均值初始化新增 token；normal 可用于随机 token 对照实验。
     token_init_strategy: avg
     # 目标 query 较多时分块计算 cross-attention，以降低峰值显存。

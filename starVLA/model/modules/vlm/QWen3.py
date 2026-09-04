@@ -84,14 +84,25 @@ class _QWen3_VL_Interface(nn.Module):
         self.space2act_active_channels: set[str] = set()
         self.space2act_action_token_ids: list[int] = []
         self._space2act_action_token_text = ""
+        self.space2act_token_order = "spatial_instruction_future_plan"
 
     def configure_space2act_tokens(
         self,
         channel_configs,
         init_strategy: str = "avg",
         action_token_count: int = 0,
+        token_order: str = "spatial_instruction_future_plan",
     ) -> None:
         """注册 S/F/P 与可选 A token bank，并记录当前阶段启用的通道。"""
+        supported_orders = {
+            "spatial_instruction_future_plan",
+            "spatial_instruction_plan_future",
+        }
+        if token_order not in supported_orders:
+            raise ValueError(
+                "Unsupported Space2Act token_order: "
+                f"{token_order}. Expected one of {sorted(supported_orders)}"
+            )
         # 即使 Stage 1 只启用 spatial，也一次性注册三类 token。这样后续 Stage 2/3
         # 切换通道时词表大小和 token id 保持稳定，已有 checkpoint 可以直接续训。
         channel_prefixes = {"spatial": "s", "future": "f", "plan": "p"}
@@ -165,6 +176,7 @@ class _QWen3_VL_Interface(nn.Module):
             int(tokenizer.convert_tokens_to_ids(token)) for token in action_tokens
         ]
         self._space2act_action_token_text = "".join(action_tokens)
+        self.space2act_token_order = token_order
         # token_enabled 只决定 forward 中是否插入，不影响已经注册的完整词表。
         self.space2act_active_channels = {
             channel
@@ -223,13 +235,17 @@ class _QWen3_VL_Interface(nn.Module):
             else:
                 prompt = instruction
 
-            # 使用 Qwen 原生 causal mask，不额外构造 block mask。物理顺序固定为
-            # image -> S -> instruction -> F -> P，使 S 读取视觉信息，F/P 再读取指令
-            # 和前序 reasoning token；未启用的 bank 不进入当前样本。
+            # 使用 Qwen 原生 causal mask，不额外构造 block mask。S 始终位于图像后、
+            # 指令前；P/F 的相对顺序由 checkpoint-visible token_order 决定。
             if "spatial" in self.space2act_active_channels:
                 content.append({"type": "text", "text": self._space2act_token_text["spatial"]})
             content.append({"type": "text", "text": prompt})
-            for channel in ("future", "plan"):
+            ordered_suffixes = (
+                ("future", "plan")
+                if self.space2act_token_order == "spatial_instruction_future_plan"
+                else ("plan", "future")
+            )
+            for channel in ordered_suffixes:
                 if channel in self.space2act_active_channels:
                     content.append({"type": "text", "text": self._space2act_token_text[channel]})
             # A tokens 位于全部 reasoning token 之后，用同一次 causal forward 汇聚

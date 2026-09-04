@@ -261,6 +261,8 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
+        if hasattr(model, "validate_pretrained_checkpoint"):
+            model.validate_pretrained_checkpoint(checkpoint_path, reload_modules=reload_modules)
         if _dist_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
