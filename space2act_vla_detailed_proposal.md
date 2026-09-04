@@ -1,6 +1,6 @@
 # Space2Act-VLA: 多世界模型教师蒸馏的三通道潜在推理方案
 
-## 实现基线与当前范围（2026-08）
+## 实现基线与当前范围（2026-09）
 
 本文档中的工程基线以仓库当前实现为准：**Qwen3-VL-4B-Instruct + GR00T
 FlowmatchingActionHead**，而不是 OpenVLA-OFT。Qwen 接收多视角图像和指令，输出完整末层
@@ -16,9 +16,10 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 - Stage 2 的 Wan2.2-TI2V-5B 监督是 `[1125, 3072]`：抓取 20-step rollout 的 final positive denoise step（zero-based step 19）、zero-based block 20 hidden，token 顺序为 `5 x 15 x 15` 的 T-H-W 展平。future mapper 为 `32 x 2560 -> 1125 x 3072`，同样使用 1024 内部维度、8 heads 和 query chunk 128。
 - Stage 3 的 Moto 监督是 `[32, 32]`：以当前 frame 为 anchor，在 16-frame future window 内构造 `0:4/4:8/8:12/12:16` 四个连续 delta-4 motion segment。每段保留 8 个、维度 32 的量化前 latent，按 segment-major 顺序拼接为 32 个目标 token。
 - 对齐损失是逐 token LayerNorm 后的 cosine + `0.1 * MSE`；AISER 关闭时总损失为 GR00T action loss 加启用通道的加权 alignment loss，开启时再加入 gate budget、attention entropy 和 slot diversity 正则。
+- 已实现可选 Confidence-Aware alignment：每个 channel 的 teacher cache 可保存 K=4 次推理的均值 target，以及与 anchor 对齐的 `confidence[A]` 标量；训练时仅用 confidence 缩放对应 alignment loss，默认 `min_weight=0.0`，不改变 action loss 或 AISER 的输入。
 - `token_enabled` 与 `alignment_enabled` 独立，支持同 token 数无 teacher loss 的 random-token control。
 - AISER 使用 proprio-state-conditioned A hidden 对 S/F/P 分别执行 token attention，默认生成 `3 x 8` 个连续 gated evidence slots；原始 S/F/P/A 不再直接作为 ActionHead KV。路由只使用 student hidden，推理不读取教师 tensor，并在所有 flow-matching denoising step 间复用一次结果。
-- Stage 1/2/3 的 legacy 课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。另有独立 progressive 入口：从第 0 步固定 S/F/P 序列，在单次 100k optimizer 轨迹中只调度教师权重；旧流程继续用于 checkpoint 课程和消融。
+- Stage 1/2/3 的 legacy 课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。另有独立 progressive、DWA、GradNorm 和 Confidence-Aware + GradNorm 入口：从第 0 步固定 S/F/P 序列，在单次 100k optimizer 轨迹中调度教师权重或 confidence-aware alignment。
 
 对应实现入口为：
 
@@ -31,6 +32,7 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_progressive_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_gradnorm_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_confidence_aware_gradnorm_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
@@ -44,12 +46,15 @@ Stage 3 已完成 Moto 全量 cache、plan shape/metadata 校验、Stage 2 -> 3 
 alignment 与 total loss 均为有限值。当前机器上的 Moto cache 已覆盖 1693 episodes；但
 LingBot/Wan cache 各 suite 只有 episode 0/1/2，因此全量 Stage 3 训练仍需先补齐这两类 cache。
 legacy 课程实验还需填写正式 Stage 2 `INIT_CHECKPOINT`。固定序列 progressive schedule、
-global-step 传递和梯度诊断代码已经接入，但 100k-step progressive/legacy Stage 3 训练与四套件
-成功率结果均尚未执行。
+global-step 传递、梯度诊断和 Confidence-Aware alignment 代码已经接入；confidence
+safetensors/packed cache、per-example alignment loss 与 legacy packed cache 兼容性已通过模块级
+smoke test。Confidence-Aware + GradNorm 的 100k 训练与四套件成功率结果尚未执行，完整
+`test_space2act` 仍受当前环境 `transformers` 与 `huggingface-hub` 版本不兼容影响。
 
 下文保留了完整研究愿景；凡涉及 block-wise mask、跨角色一致性、teacher dropout、额外
-resampler 或 PCGrad 梯度干预的内容，均应视为后续研究选项，而非当前实现承诺。当前还提供
-独立的 GradNorm-style 梯度均衡权重入口，见第 3.3 节；PCGrad 仍未接入默认训练路径。
+resampler 或更复杂 PCGrad 变体的内容，均应视为后续研究选项，而非当前实现承诺。当前已提供
+独立的 GradNorm-style、Confidence-Aware + GradNorm 与可选 Feature-Level PCGrad 入口，见第 3.3 节；
+PCGrad 默认关闭，不改变既有训练路径。
 
 ## 0. 方案定位
 
@@ -443,14 +448,35 @@ context 与 $R_S,R_F,R_P$ 构成。
 $$
 \mathcal{L}
 = \mathcal{L}_{act}
-+ \lambda_S \mathcal{L}_S
-+ \lambda_F \mathcal{L}_F
-+ \lambda_P \mathcal{L}_P
++ \lambda_S \mathcal{L}^{conf}_S
++ \lambda_F \mathcal{L}^{conf}_F
++ \lambda_P \mathcal{L}^{conf}_P
 + \lambda_{SF}\mathcal{L}_{SF}
 + \lambda_{FP}\mathcal{L}_{FP}
 + \lambda_{role}\mathcal{L}_{role}
 + \mathcal{L}_{route}.
 $$
+
+当 Confidence-Aware alignment 关闭时，$\mathcal{L}^{conf}_c$ 退化为原有的等权
+$\mathcal{L}_c$。开启后，aligner 先为 batch 中每个 anchor 返回未加权的逐样本误差
+$\ell_{a,c}$，再使用缓存中的 `confidence[a,c] \in [0,1]` 生成：
+
+$$
+w_{a,c}=w_{min}+(1-w_{min})\,confidence_{a,c},
+\qquad
+\mathcal{L}^{conf}_c=
+\frac{\sum_a w_{a,c}\ell_{a,c}}
+{\sum_a w_{a,c}+\epsilon}.
+$$
+
+当前实现和 Confidence-Aware + GradNorm 入口默认 `w_min=0.0`，因此
+`confidence=0` 的 teacher target 不产生 alignment 梯度；该值可通过
+`CONFIDENCE_MIN_WEIGHT` 或 `framework.latent_reasoning.confidence_aware_alignment.min_weight`
+调整。有效权重归一化保持不同 batch 的 alignment loss 尺度稳定，并记录 raw alignment loss、
+confidence 均值、有效监督比例和 zero-confidence 比例。confidence 只改变教师 alignment
+分支，不改变 action loss。由于 S/F/P hidden 同时作为 ActionHead 或 AISER 的 student context，
+alignment 梯度会通过共享 Qwen backbone 间接影响后续 action context；但 raw teacher feature、
+confidence 和 alignment mapper 输出都不直接输入 ActionHead，推理时仍保持 teacher-free。
 
 $\mathcal{L}_{role}$ 用于防止三类 token 表征坍缩，可采用简单的 role disentanglement 正则：
 
@@ -483,7 +509,23 @@ StarVLA 启动时只为启用 alignment 的通道建立索引，并严格校验�
 loader 还会锁定 checkpoint hash、FPS、四段 offset、latent 类型、token 顺序、尾部策略和
 preprocessor，避免误用其他 Moto 版本或可视化抽样配置。
 
-所有教师都只在训练阶段使用。部署时不调用教师，也不生成视频或文本 CoT。
+### 3.1.1 Confidence-Aware teacher cache
+
+Confidence-Aware 版本沿用相同的 episode/anchor/channel 索引，但每个 episode 文件额外保存
+`confidence[A]` 和可选的 `disagreement[A]`。`confidence[a]` 是对应 `features[a]` 的
+`[0,1]` 标量，不扩展到 teacher token 维度；因此 confidence 不改变原有 feature mmap 布局。
+当前 `samples4_confv1` cache 使用 K=4 次语义保持的 teacher 推理，`features` 保存四次输出
+的均值，confidence 由 token-level pairwise cosine disagreement 聚合并按 channel 校准得到。
+loader 会同时校验 confidence 的存在性、长度、float dtype、有限值和 `[0,1]` 范围，并确保它
+与 latest anchor feature 使用完全相同的时序映射。
+
+执行 `tools/pack_teacher_latents.py` 后，packed cache 保留原有 `features.bin`，另写独立的
+`confidence.bin`；manifest 增加 confidence 的 dtype、全局 shape 以及每个 episode 的
+`confidence_offset/count`。Confidence-Aware 开启时，旧的 feature-only safetensors 或 format-1
+packed cache 会明确拒绝；关闭时仍保持旧缓存兼容。
+
+所有教师都只在训练阶段使用。部署时不调用教师，也不生成视频或文本 CoT；部署路径不会读取
+teacher feature、confidence 或 alignment mapper。
 
 ### 3.2 三阶段课程学习
 
@@ -610,12 +652,27 @@ relative-training-rate target 的完整变体。当前权重、EMA、最近一�
 计数写入同一个 `steps_N_adaptive.json`，断点恢复后继续当前窗口。GradNorm 与 DWA/fixed knots
 互斥，三者使用独立启动脚本和独立状态模式。
 
-PCGrad 仍保留为独立研究分支，而不是被 AISER 否定。参数级 PCGrad 与 ZeRO-2 的分片梯度
-契约冲突较大，不作为首选实现；若长期日志同时出现显著负 gradient cosine 和 Action Success
-Rate 下降，可优先验证 Feature-Level PCGrad：在 Qwen 最后一层 hidden bottleneck 上获取 action
-与 alignment 梯度并执行正交投影，再向基座传播。该分支必须有独立开关，并与 AISER 做正交
-消融（none / AISER / Feature-Level PCGrad / both）；在触发条件出现前只保留设计与诊断，不接入
-当前训练默认路径。
+独立入口 `run_space2act_confidence_aware_gradnorm_train.sh` 同时开启
+`confidence_aware_alignment` 与 GradNorm。三路目录默认指向
+`lingbot_latent_step4_numlayer24_stride16_samples4_confv1`、
+`wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1` 和
+`moto_plan_latent_pre_vq_delta4x4_h16_stride1_epoch10_samples4_confv1`，并强制要求缓存包含
+confidence。该入口默认使用 safetensors；对每路执行 `pack_teacher_latents.py` 生成带
+`confidence.bin` 的 packed cache 后，可设置 `USE_PACKED_TEACHERS=1` 切换 mmap 后端。
+`CONFIDENCE_MIN_WEIGHT` 默认是 `0.0`，用于在统计 zero-confidence 比例后调整低可靠 target
+的最小监督强度。GradNorm 的外层三路权重和 confidence 的样本级权重相乘，二者分别控制
+channel-level budget 与 anchor-level teacher reliability。
+
+PCGrad 作为独立研究分支实现为 action-anchored Feature-Level PCGrad。参数级 PCGrad 与
+ZeRO-2 的分片梯度契约冲突较大，因此不修改参数 `.grad`。训练时在 Qwen 最后一层
+`last_hidden` 瓶颈获取 action 与三路 weighted alignment 梯度；当某一路 cosine 小于
+`trigger_cosine`（默认 `-0.05`）时，将该教师梯度中的 action 反向分量正交投影掉，再通过
+`last_hidden` backward hook 向基座传播。alignment head 与 action head 的私有参数梯度保持
+原值，AISER 的 router 正则默认不参与投影。配置位于 `latent_reasoning.pcgrad`，默认关闭，
+可与 DWA/GradNorm 和 AISER 组合；独立入口为
+`examples/simBenchmarks/LIBERO/train_files/run_space2act_pcgrad_train.sh`。日志记录每个通道
+投影前后 cosine、触发率和移除梯度比例，并与 AISER 做
+`none / AISER / Feature-Level PCGrad / both` 正交消融。
 
 已有 $\lambda_S=1.0$ 的 Stage 1 在 80k 获得最佳 LIBERO rollout success，它保留为 strong-S
 legacy 对照。它不作为 progressive 主实验起点，因为其序列结构、loss 历史和已消耗步数与新的
@@ -715,6 +772,10 @@ loss 只作为诊断指标。
 - 去掉 $\mathcal{L}_{role}$；
 - cosine-only vs MSE-only vs cosine+MSE；
 - joint training vs three-stage curriculum；
+- 单次 teacher target + 等权 alignment；
+- K=4 均值 target + 等权 alignment；
+- K=4 均值 target + Confidence-Aware alignment（主方案）；
+- `min_weight=0/0.1/0.2` 与 hard masking 对比；
 - teacher dropout 的比例；
 - 只训练 token/projector vs LoRA 微调 vs 全量微调。
 
@@ -759,6 +820,10 @@ loss 只作为诊断指标。
 - Attention-to-change alignment: 检查 $F \rightarrow S$ attention 是否集中于教师变化区域。
 - AISER gate/slot profile: 分任务阶段报告各通道 gate、有效 slot 数、attention entropy 与
   Action Success Rate 的关系，检查全开、全关或 slot collapse。
+- Confidence 分桶：报告 confidence 分位数、zero-confidence 比例及各桶的留出 teacher error；
+- Reliability-gradient probe：比较 confidence 加权前后的 alignment gradient norm、与 action
+  gradient 的 cosine，以及不同 confidence 桶的 action success，确认低可靠教师不会主导 shared
+  hidden 的更新。
 
 ### 4.6 关键假设与预期结果
 
@@ -785,9 +850,17 @@ action KV 长度的同时提升 success，并产生随任务阶段变化的 chan
 **H7: teacher-free inference 能保持低延迟。**
 训练阶段读取离线教师特征并执行 mapper，但推理阶段只增加固定数量 latent token，mapper 分支完全跳过。相比需要外部 world model rollout 或显式 CoT 生成的方法，额外延迟只来自 Qwen 序列中的少量 token。
 
+**H8: Confidence-Aware alignment 能降低错误教师的表示偏置。**
+当多次 teacher 推理之间存在较高 disagreement 时，直接等权蒸馏会把不稳定 target 当作确定监督。
+Confidence-Aware alignment 通过 anchor/channel 级 confidence 重新归一化 alignment loss，预期在
+保持高 confidence teacher 学习强度的同时，降低低 confidence 桶对 shared hidden 的梯度贡献，
+从而改善 action success、接触稳定性或视角扰动鲁棒性。该机制不直接缩放 ActionHead 输入：
+action loss 仍正常训练，confidence 通过 shared Qwen backbone 间接影响 ActionHead 使用的
+student context；因此训练与 teacher-free 推理不存在离线 confidence 缺失造成的输入分布偏移。
+
 ## 5. 论文贡献写法
 
-可以将贡献组织为三点。
+可以将贡献组织为四点。
 
 **Contribution 1: Typed latent reasoning for VLA.**  
 提出一种面向具身控制的三通道潜在推理范式，将 VLA 内部 reasoning token 明确分解为空间位置感知、未来状态推演和潜在动作规划三种角色，避免文本 CoT 的低密度和弱 grounding 问题。
@@ -795,7 +868,14 @@ action KV 长度的同时提升 success，并产生随任务阶段变化的 chan
 **Contribution 2: Multi-world-model distillation without inference-time teachers.**  
 提出将空间探索世界模型、具身未来预测世界模型和潜动作教师的能力蒸馏进 VLA latent tokens，使模型在推理时不依赖外部 world model 或显式 CoT，也能自主形成未来状态推演。
 
-**Contribution 3: Action-intent-guided sparse evidence routing.**
+**Contribution 3: Confidence-aware multi-teacher alignment.**
+针对世界模型教师可能产生 hallucination、随机性或边界条件错误的问题，使用 K 次语义保持
+推理的均值作为 target，并由 anchor/channel 级 disagreement 得到 confidence。训练时仅对
+对应 alignment 分支进行 per-example 可靠性加权和有效权重归一化；该机制不改变 action loss，
+也不把离线 confidence 暴露给 teacher-free inference。Confidence-Aware 与 GradNorm 可组合，
+分别处理样本级 teacher reliability 和通道级 auxiliary budget。
+
+**Contribution 4: Action-intent-guided sparse evidence routing.**
 提出由 proprio-state-conditioned Action Intent Tokens 驱动的稀疏路由，在 action decoding 前将
 teacher-supervised S/F/P hidden 转换为紧凑的 gated evidence slots，使三类教师保持对称地位，
 同时让每个 action chunk 自适应选择空间、未来与运动计划证据。
@@ -827,8 +907,10 @@ teacher-supervised S/F/P hidden 转换为紧凑的 gated evidence slots，使三
 5. 补齐或迁移全量 LingBot/Wan cache，并对四个 suite 做 1693-episode 三教师联合审计；当前本机联合审计只覆盖每个 suite 的 episode 0/1/2。
 6. 已用空 `INIT_CHECKPOINT` 完成 legacy Stage 3 cold-start 的 4 卡 ZeRO-2 单步训练与保存验证；固定序列 progressive 入口、0.30 总辅助预算和 hidden-gradient 诊断也已实现。
 7. 已实现可选 Stage 3 AISER：A token 注册、state-conditioned 三通道路由、typed-token replacement、训练/推理共享的一次性 evidence context、辅助指标和旧 checkpoint bootstrap；下一步先做真实 ZeRO-2 单步与 teacher-free rollout smoke test。
-8. 分别运行 100k action-only fixed-token、direct-joint、progressive 和 AISER 等算力主实验，在 20k/50k/80k/100k 执行四套件 teacher-free 评估，并报告 success、S/F/P masking、gate/slot profile、alignment 与梯度冲突指标；已有 80k strong-S checkpoint 单独作为非等配方 legacy 对照。
-9. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$ 及 AISER 消融矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout、Feature-Level PCGrad 和跨角色一致性损失。
+8. 已接入 Confidence-Aware alignment：支持 `confidence[A]` safetensors、独立 `confidence.bin` packed cache、严格范围/shape 校验、per-example alignment loss、有效权重归一化和 confidence 诊断日志；默认 `min_weight=0.0`，可由训练入口覆盖。
+9. 已新增 `run_space2act_confidence_aware_gradnorm_train.sh`，默认使用 `samples4_confv1` 三教师缓存并将 Confidence-Aware 与 GradNorm 组合；Confidence-Aware + GradNorm 的真实 100k 训练和四套件成功率尚未执行。
+10. 分别运行 100k action-only fixed-token、direct-joint、progressive、GradNorm、Confidence-Aware + GradNorm 和 AISER 等算力主实验，在 20k/50k/80k/100k 执行四套件 teacher-free 评估，并报告 success、S/F/P masking、confidence 分桶、gate/slot profile、alignment 与梯度冲突指标；已有 80k strong-S checkpoint 单独作为非等配方 legacy 对照。
+11. 完成 random latent、$F$ only、$P$ only、$S+F$、$S+F+P$、Confidence-Aware、AISER 和 Feature-Level PCGrad 消融矩阵后，再决定是否扩展到 RoboTwin、block-wise mask、teacher dropout 和跨角色一致性损失。
 
 如果资源受限，优先顺序建议为：
 

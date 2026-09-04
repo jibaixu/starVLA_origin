@@ -30,6 +30,50 @@ def _is_enabled(value) -> bool:
     return value in (True, "True", "true", 1)
 
 
+def _normalize_confidence_aware_config(config) -> dict[str, float | bool]:
+    """Validate alignment-only teacher confidence weighting options."""
+    config = config or {}
+    enabled = _is_enabled(config.get("enabled", False))
+    min_weight = float(config.get("min_weight", 0.0))
+    if not math.isfinite(min_weight) or not 0.0 <= min_weight <= 1.0:
+        raise ValueError("confidence_aware_alignment min_weight must be finite and within [0, 1]")
+    return {
+        "enabled": enabled,
+        "min_weight": min_weight,
+        "require_cached_confidence": _is_enabled(config.get("require_cached_confidence", True)),
+    }
+
+
+def _normalize_pcgrad_config(config) -> dict[str, float | int | bool]:
+    """Validate action-anchored feature-level PCGrad options."""
+    config = config or {}
+    enabled = _is_enabled(config.get("enabled", False))
+    threshold = float(config.get("trigger_cosine", -0.05))
+    if not math.isfinite(threshold) or threshold < -1.0 or threshold > 0.0:
+        raise ValueError("pcgrad trigger_cosine must be finite and within [-1, 0]")
+    warmup_steps = config.get("warmup_steps", 5000)
+    if (
+        isinstance(warmup_steps, bool)
+        or int(warmup_steps) != float(warmup_steps)
+        or int(warmup_steps) < 0
+    ):
+        raise ValueError("pcgrad warmup_steps must be a non-negative integer")
+    epsilon = float(config.get("epsilon", 1e-12))
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("pcgrad epsilon must be finite and positive")
+    project_router = _is_enabled(config.get("project_router", False))
+    if project_router:
+        raise ValueError("Feature-level PCGrad currently projects teacher alignment losses only")
+    return {
+        "enabled": enabled,
+        "trigger_cosine": threshold,
+        "warmup_steps": int(warmup_steps),
+        "epsilon": epsilon,
+        # Router regularizers are deliberately kept outside the PCGrad task set.
+        "project_router": project_router,
+    }
+
+
 def _normalize_loss_schedule(schedule_cfg, active_channels) -> tuple[tuple[int, dict[str, float]], ...]:
     """校验 progressive knots，并转换为只含 Python 标量的不可变结构。"""
     if not schedule_cfg or not _is_enabled(schedule_cfg.get("enabled", False)):
@@ -297,6 +341,18 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "routing_mode": "native_causal",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
+            "confidence_aware_alignment": {
+                "enabled": False,
+                "min_weight": 0.0,
+                "require_cached_confidence": True,
+            },
+            "pcgrad": {
+                "enabled": False,
+                "trigger_cosine": -0.05,
+                "warmup_steps": 5000,
+                "epsilon": 1e-12,
+                "project_router": False,
+            },
             "evidence_routing": {
                 "enabled": False,
                 "action_token_count": 8,
@@ -407,6 +463,12 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             )
         self.alignment_heads = nn.ModuleDict()
         self.alignment_loss_weights: dict[str, float] = {}
+        self.confidence_aware_config = _normalize_confidence_aware_config(
+            latent_cfg.get("confidence_aware_alignment", {})
+        )
+        self.pcgrad_config = _normalize_pcgrad_config(latent_cfg.get("pcgrad", {}))
+        self.pcgrad_steps = 0
+        self.pcgrad_projection_counts = {channel: 0 for channel in _SPACE2ACT_CHANNELS}
         for channel, channel_cfg in latent_cfg.channels.items():
             if channel_cfg.get("alignment_enabled", False) not in (True, "True", "true", 1):
                 continue
@@ -650,6 +712,46 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if training_step is None:
             raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
         return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
+
+    def _confidence_weighted_alignment_loss(
+        self, per_example_loss: torch.Tensor, confidence: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Reduce per-sample alignment errors without letting reliability change loss scale."""
+        if per_example_loss.ndim != 1 or confidence.shape != per_example_loss.shape:
+            raise ValueError("Confidence and per-example alignment loss must both have shape [B]")
+        if not torch.isfinite(confidence).all() or torch.any(confidence < 0.0) or torch.any(confidence > 1.0):
+            raise ValueError("Space2Act confidence must be finite and within [0, 1]")
+
+        min_weight = float(self.confidence_aware_config["min_weight"])
+        weights = min_weight + (1.0 - min_weight) * confidence.float()
+        local_weight_sum = weights.sum()
+        global_weight_sum = local_weight_sum.detach().clone()
+        global_count = confidence.new_tensor(float(confidence.numel()))
+        global_active_count = (weights > 0.0).float().sum().detach()
+        global_zero_confidence_count = (confidence == 0.0).float().sum().detach()
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_weight_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_active_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_zero_confidence_count, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+
+        # DDP averages gradients across ranks. Scaling each local differentiable
+        # numerator by world_size gives the desired global weighted mean.
+        if float(global_weight_sum.item()) > torch.finfo(weights.dtype).eps:
+            weighted_loss = (weights * per_example_loss).sum() * (world_size / global_weight_sum)
+        else:
+            weighted_loss = per_example_loss.sum() * 0.0
+
+        metrics = {
+            "raw_loss": per_example_loss.mean().detach(),
+            "confidence_mean": confidence.float().mean().detach(),
+            "effective_weight_mean": (global_weight_sum / global_count.clamp_min(1.0)).detach(),
+            "effective_supervision_ratio": (global_active_count / global_count.clamp_min(1.0)).detach(),
+            "zero_confidence_ratio": (global_zero_confidence_count / global_count.clamp_min(1.0)).detach(),
+        }
+        return weighted_loss, metrics
 
     def _compute_gradnorm_probe(
         self, last_hidden: torch.Tensor, channel_losses: dict[str, torch.Tensor]
@@ -1160,6 +1262,126 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         )
         return {name: value.detach() for name, value in diagnostics.items()}
 
+    def _prepare_pcgrad_hook(
+        self,
+        last_hidden: torch.Tensor,
+        action_loss: torch.Tensor,
+        channel_losses: dict[str, torch.Tensor],
+        effective_weights: dict[str, float],
+        training_step: int,
+    ) -> dict[str, torch.Tensor]:
+        """Project auxiliary feature gradients away from conflicting action gradients.
+
+        The hook changes only the gradient entering the Qwen backbone at the shared
+        ``last_hidden`` bottleneck. Private alignment-head and action-head parameter
+        gradients are left untouched, which keeps this operation compatible with
+        ZeRO parameter sharding.
+        """
+        metrics: dict[str, torch.Tensor] = {}
+        config = self.pcgrad_config
+        active = (
+            bool(config["enabled"])
+            and self.training
+            and int(training_step) > int(config["warmup_steps"])
+            and last_hidden.requires_grad
+            and bool(channel_losses)
+        )
+        if not active:
+            return metrics
+
+        action_grad = torch.autograd.grad(
+            action_loss, last_hidden, retain_graph=True, create_graph=False
+        )[0].detach().float()
+        action_norm_sq = action_grad.square().sum()
+        eps = float(config["epsilon"])
+        if dist.is_available() and dist.is_initialized():
+            global_action_norm_sq = action_norm_sq.detach().clone()
+            dist.all_reduce(global_action_norm_sq, op=dist.ReduceOp.SUM)
+        else:
+            global_action_norm_sq = action_norm_sq.detach()
+
+        delta = torch.zeros_like(action_grad)
+        threshold = float(config["trigger_cosine"])
+        self.pcgrad_steps = int(getattr(self, "pcgrad_steps", 0)) + 1
+        projection_counts = getattr(
+            self, "pcgrad_projection_counts", {channel: 0 for channel in _SPACE2ACT_CHANNELS}
+        )
+        for channel, channel_loss in channel_losses.items():
+            weighted_loss = float(effective_weights[channel]) * channel_loss
+            auxiliary_grad = torch.autograd.grad(
+                weighted_loss, last_hidden, retain_graph=True, create_graph=False
+            )[0].detach().float()
+            local_dot = (action_grad * auxiliary_grad).sum()
+            local_aux_norm_sq = auxiliary_grad.square().sum()
+            if dist.is_available() and dist.is_initialized():
+                global_dot = local_dot.detach().clone()
+                global_aux_norm_sq = local_aux_norm_sq.detach().clone()
+                dist.all_reduce(global_dot, op=dist.ReduceOp.SUM)
+                dist.all_reduce(global_aux_norm_sq, op=dist.ReduceOp.SUM)
+            else:
+                global_dot = local_dot.detach()
+                global_aux_norm_sq = local_aux_norm_sq.detach()
+
+            denominator = torch.sqrt(
+                global_action_norm_sq.clamp_min(eps)
+                * global_aux_norm_sq.clamp_min(eps)
+            )
+            cosine = global_dot / denominator
+            should_project = bool(
+                float(global_action_norm_sq.item()) > eps
+                and float(global_aux_norm_sq.item()) > eps
+                and float(cosine.item()) < threshold
+            )
+            projected = auxiliary_grad
+            if should_project:
+                coefficient = global_dot / global_action_norm_sq.clamp_min(eps)
+                projected = auxiliary_grad - coefficient * action_grad
+                delta.add_(projected - auxiliary_grad)
+                projection_counts[channel] = int(projection_counts.get(channel, 0)) + 1
+
+            removed_norm_sq = (projected - auxiliary_grad).square().sum()
+            if dist.is_available() and dist.is_initialized():
+                global_removed_norm_sq = removed_norm_sq.detach().clone()
+                dist.all_reduce(global_removed_norm_sq, op=dist.ReduceOp.SUM)
+            else:
+                global_removed_norm_sq = removed_norm_sq.detach()
+            metrics[f"pcgrad/{channel}_cosine_before"] = cosine.detach()
+            metrics[f"pcgrad/{channel}_cosine_after"] = (
+                torch.zeros_like(cosine) if should_project else cosine.detach()
+            )
+            metrics[f"pcgrad/{channel}_applied"] = last_hidden.new_tensor(
+                float(should_project), dtype=torch.float32
+            )
+            metrics[f"pcgrad/{channel}_removed_norm_ratio"] = torch.sqrt(
+                global_removed_norm_sq.clamp_min(0.0)
+                / global_aux_norm_sq.clamp_min(eps)
+            ).detach()
+            metrics[f"pcgrad/{channel}_trigger_rate"] = last_hidden.new_tensor(
+                float(projection_counts.get(channel, 0)) / max(self.pcgrad_steps, 1),
+                dtype=torch.float32,
+            )
+        self.pcgrad_projection_counts = projection_counts
+
+        delta_norm_sq = delta.square().sum()
+        if dist.is_available() and dist.is_initialized():
+            global_delta_norm_sq = delta_norm_sq.detach().clone()
+            dist.all_reduce(global_delta_norm_sq, op=dist.ReduceOp.SUM)
+        else:
+            global_delta_norm_sq = delta_norm_sq.detach()
+        metrics["pcgrad/total_projection_norm"] = torch.sqrt(
+            global_delta_norm_sq.clamp_min(0.0)
+        ).detach()
+
+        # Capture a detached FP32 correction. The hook is called during the normal
+        # backward pass after all branches have contributed to last_hidden.
+        correction = delta.detach()
+
+        def _apply_correction(gradient: torch.Tensor) -> torch.Tensor:
+            return gradient + correction.to(device=gradient.device, dtype=gradient.dtype)
+
+        last_hidden.register_hook(_apply_correction)
+        return metrics
+
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
         training_step = kwargs.pop("training_step", None)
         run_gradient_diagnostics = kwargs.pop("run_gradient_diagnostics", True)
@@ -1217,7 +1439,51 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             )
             teachers = [example[teacher_key][channel] for example in examples]
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                channel_loss = aligner.compute_loss(compact_hidden, teachers)
+                if self.confidence_aware_config["enabled"]:
+                    confidence_key = "space2act_confidence"
+                    has_cached_confidence = all(
+                        confidence_key in example and channel in example[confidence_key]
+                        for example in examples
+                    )
+                    has_any_cached_confidence = any(
+                        confidence_key in example and channel in example[confidence_key]
+                        for example in examples
+                    )
+                    if has_any_cached_confidence and not has_cached_confidence:
+                        raise KeyError(
+                            f"Inconsistent Space2Act confidence batch for enabled channel '{channel}'"
+                        )
+                    if not has_cached_confidence and self.confidence_aware_config[
+                        "require_cached_confidence"
+                    ]:
+                        raise KeyError(
+                            f"Missing Space2Act confidence tensors for enabled channel '{channel}'"
+                        )
+                    if has_cached_confidence:
+                        confidence = torch.stack(
+                            [torch.as_tensor(example[confidence_key][channel]).reshape(()) for example in examples]
+                        ).to(device=last_hidden.device, dtype=torch.float32, non_blocking=True)
+                    else:
+                        confidence = torch.ones(
+                            len(examples), device=last_hidden.device, dtype=torch.float32
+                        )
+                    per_example_loss = aligner.compute_per_example_loss(compact_hidden, teachers)
+                    channel_loss, confidence_metrics = self._confidence_weighted_alignment_loss(
+                        per_example_loss, confidence
+                    )
+                    losses[f"{channel}_alignment_raw_loss"] = confidence_metrics["raw_loss"]
+                    losses[f"{channel}_confidence_mean"] = confidence_metrics["confidence_mean"]
+                    losses[f"{channel}_effective_weight_mean"] = confidence_metrics[
+                        "effective_weight_mean"
+                    ]
+                    losses[f"{channel}_effective_supervision_ratio"] = confidence_metrics[
+                        "effective_supervision_ratio"
+                    ]
+                    losses[f"{channel}_zero_confidence_ratio"] = confidence_metrics[
+                        "zero_confidence_ratio"
+                    ]
+                else:
+                    channel_loss = aligner.compute_loss(compact_hidden, teachers)
             weighted_channel_loss = weight * channel_loss
             losses[f"{channel}_alignment_loss"] = channel_loss
             losses[f"{channel}_weighted_alignment_loss"] = weighted_channel_loss
@@ -1306,6 +1572,22 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             )
             if should_probe:
                 losses.update(self._compute_gradnorm_probe(last_hidden, channel_losses))
+
+        if (
+            self.pcgrad_config["enabled"]
+            and training_step is not None
+            and torch.is_grad_enabled()
+            and last_hidden.requires_grad
+        ):
+            losses.update(
+                self._prepare_pcgrad_hook(
+                    last_hidden,
+                    action_loss,
+                    channel_losses,
+                    effective_weights,
+                    int(training_step),
+                )
+            )
 
         # trainer 优先反传 total_loss；同时保留分项，便于独立观察 action 与各教师损失。
         losses["action_loss"] = action_loss

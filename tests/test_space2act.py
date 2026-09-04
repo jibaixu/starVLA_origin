@@ -28,6 +28,7 @@ from starVLA.model.framework.VLM4A.QwenSpace2ActGR00T import (
     QwenSpace2Act_GR00T,
     _normalize_dwa_config,
     _normalize_gradnorm_config,
+    _normalize_pcgrad_config,
     _interpolate_loss_schedule,
     _normalize_loss_schedule,
     _project_bounded_simplex,
@@ -42,15 +43,15 @@ def _write_teacher(
     features: torch.Tensor,
     anchors: torch.Tensor,
     metadata: dict[str, str] | None = None,
+    confidence: torch.Tensor | None = None,
 ) -> None:
     """按真实目录和字段约定生成一个最小 safetensors 教师文件。"""
     path = root / "latents" / "chunk-000" / "episode_000000.safetensors"
     path.parent.mkdir(parents=True)
-    save_file(
-        {"features": features, "anchor_frames": anchors},
-        path,
-        metadata=metadata,
-    )
+    tensors = {"features": features, "anchor_frames": anchors}
+    if confidence is not None:
+        tensors["confidence"] = confidence
+    save_file(tensors, path, metadata=metadata)
 
 
 class Space2ActTest(unittest.TestCase):
@@ -115,6 +116,57 @@ class Space2ActTest(unittest.TestCase):
             self.assertEqual(tuple(batch.shape), (2, 2, 4))
             self.assertTrue(torch.equal(batch[0], features[0]))
             self.assertTrue(torch.equal(batch[1], features[1]))
+
+    def test_confidence_teacher_store_matches_feature_anchor_for_safetensors_and_packed(self):
+        """Confidence 必须和 feature 共用相同的 latest-anchor 映射。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            features = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4)
+            confidence = torch.tensor([0.1, 0.5, 1.0], dtype=torch.float32)
+            _write_teacher(root, features, torch.tensor([0, 16, 32]), confidence=confidence)
+            spec = TeacherChannelSpec(
+                "spatial", "latents", 2, 4, require_confidence=True
+            )
+            store = EpisodeTeacherStore(root, spec, [0])
+            feature, value = store.get_with_confidence(0, 16)
+            self.assertTrue(torch.equal(feature, features[1]))
+            self.assertEqual(value.item(), confidence[1].item())
+
+            pack(root, "latents", "latents_packed")
+            packed_store = EpisodeTeacherStore(
+                root,
+                TeacherChannelSpec(
+                    "spatial", "latents", 2, 4,
+                    require_confidence=True, packed_relative_dir="latents_packed",
+                ),
+                [0],
+            )
+            feature, value = packed_store.get_with_confidence(0, 100)
+            self.assertTrue(torch.equal(feature, features[2]))
+            self.assertEqual(value.item(), confidence[2].item())
+
+    def test_confidence_teacher_store_rejects_missing_or_invalid_values(self):
+        """开启 confidence-aware 时不允许旧缓存、NaN 或越界 confidence。"""
+        cases = (
+            ("missing tensors", None),
+            ("must be finite", torch.tensor([0.1, float("nan")], dtype=torch.float32)),
+            ("within [0, 1]", torch.tensor([0.1, 1.1], dtype=torch.float32)),
+        )
+        for error, confidence in cases:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                _write_teacher(
+                    root,
+                    torch.zeros(2, 2, 4),
+                    torch.tensor([0, 16]),
+                    confidence=confidence,
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    EpisodeTeacherStore(
+                        root,
+                        TeacherChannelSpec("spatial", "latents", 2, 4, require_confidence=True),
+                        [0],
+                    )
 
     def test_teacher_store_fails_on_shape_mismatch(self):
         """教师张量与配置契约不一致时，应在建索引阶段尽早报错。"""
@@ -339,6 +391,28 @@ class Space2ActTest(unittest.TestCase):
         aligner = CrossAttentionLatentAligner(8, 7, 6, alignment_dim=8, num_heads=2)
         with self.assertRaisesRegex(ValueError, "Expected teacher shape"):
             aligner.compute_loss(torch.randn(1, 4, 8), [torch.randn(6, 6)])
+
+    def test_confidence_weighting_ignores_zero_confidence_gradients(self):
+        """min_weight=0 时 zero-confidence target 不得贡献 alignment 梯度。"""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.confidence_aware_config = {"min_weight": 0.0}
+        per_example_loss = torch.tensor([1.0, 100.0], requires_grad=True)
+        confidence = torch.tensor([1.0, 0.0])
+        loss, metrics = QwenSpace2Act_GR00T._confidence_weighted_alignment_loss(
+            framework, per_example_loss, confidence
+        )
+        self.assertAlmostEqual(loss.item(), 1.0)
+        self.assertAlmostEqual(metrics["raw_loss"].item(), 50.5)
+        loss.backward()
+        self.assertTrue(torch.equal(per_example_loss.grad, torch.tensor([1.0, 0.0])))
+
+        all_zero = torch.tensor([2.0, 3.0], requires_grad=True)
+        loss, _ = QwenSpace2Act_GR00T._confidence_weighted_alignment_loss(
+            framework, all_zero, torch.zeros(2)
+        )
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertTrue(torch.equal(all_zero.grad, torch.zeros(2)))
 
     def test_action_guided_router_shapes_metrics_and_gradients(self):
         """AISER 应为每个 A token 生成三路 slot，并保持 action/state/channel 可训练。"""
@@ -866,6 +940,52 @@ class Space2ActTest(unittest.TestCase):
         total_loss.backward()
         self.assertIsNotNone(hidden.grad)
         self.assertTrue(torch.isfinite(hidden.grad).all())
+
+    def test_pcgrad_projects_conflicting_alignment_feature_gradient(self):
+        """A conflicting teacher component is removed at the shared hidden bottleneck."""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.training = True
+        framework.pcgrad_config = _normalize_pcgrad_config(
+            {"enabled": True, "trigger_cosine": -0.05, "warmup_steps": 0}
+        )
+        hidden = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
+        action_loss = (hidden[..., 0] - 1.0).square().mean()
+        channel_losses = {"spatial": (hidden[..., 0] + 1.0).square().mean()}
+        metrics = QwenSpace2Act_GR00T._prepare_pcgrad_hook(
+            framework,
+            hidden,
+            action_loss,
+            channel_losses,
+            {"spatial": 1.0},
+            training_step=1,
+        )
+        (action_loss + channel_losses["spatial"]).backward()
+        self.assertAlmostEqual(hidden.grad[0, 0, 0].item(), -2.0, places=5)
+        self.assertAlmostEqual(metrics["pcgrad/spatial_cosine_before"].item(), -1.0, places=5)
+        self.assertEqual(metrics["pcgrad/spatial_applied"].item(), 1.0)
+        self.assertAlmostEqual(metrics["pcgrad/spatial_cosine_after"].item(), 0.0, places=5)
+
+    def test_pcgrad_keeps_non_conflicting_alignment_gradient(self):
+        """A non-conflicting teacher component passes through unchanged."""
+        framework = object.__new__(QwenSpace2Act_GR00T)
+        framework.training = True
+        framework.pcgrad_config = _normalize_pcgrad_config(
+            {"enabled": True, "trigger_cosine": -0.05, "warmup_steps": 0}
+        )
+        hidden = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
+        action_loss = (hidden[..., 0] - 1.0).square().mean()
+        channel_losses = {"spatial": (hidden[..., 0] - 2.0).square().mean()}
+        metrics = QwenSpace2Act_GR00T._prepare_pcgrad_hook(
+            framework,
+            hidden,
+            action_loss,
+            channel_losses,
+            {"spatial": 1.0},
+            training_step=1,
+        )
+        (action_loss + channel_losses["spatial"]).backward()
+        self.assertAlmostEqual(hidden.grad[0, 0, 0].item(), -6.0, places=5)
+        self.assertEqual(metrics["pcgrad/spatial_applied"].item(), 0.0)
 
     def test_base_checkpoint_keeps_new_token_initialization(self):
         """加载旧 base 权重时，新增 Space2Act token 行应保留当前初始化值。"""

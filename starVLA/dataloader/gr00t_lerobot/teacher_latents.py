@@ -21,8 +21,11 @@ class TeacherChannelSpec:
     target_dim: int
     feature_key: str = "features"
     anchor_key: str = "anchor_frames"
+    confidence_key: str = "confidence"
     feature_dtype: str | None = None
     anchor_dtype: str | None = None
+    confidence_dtype: str | None = "float32"
+    require_confidence: bool = False
     anchor_stride: int | None = None
     validate_episode_length: bool = False
     expected_metadata: dict[str, str] | None = None
@@ -54,12 +57,19 @@ class TeacherChannelSpec:
             target_dim=int(target_dim),
             feature_key=str(config.get("feature_key", "features")),
             anchor_key=str(config.get("anchor_key", "anchor_frames")),
+            confidence_key=str(config.get("confidence_key", "confidence")),
             feature_dtype=(
                 str(config.get("feature_dtype")) if config.get("feature_dtype", None) is not None else None
             ),
             anchor_dtype=(
                 str(config.get("anchor_dtype")) if config.get("anchor_dtype", None) is not None else None
             ),
+            confidence_dtype=(
+                str(config.get("confidence_dtype"))
+                if config.get("confidence_dtype", "float32") is not None
+                else None
+            ),
+            require_confidence=config.get("require_confidence", False) in (True, "True", "true", 1),
             anchor_stride=(
                 int(config.get("anchor_stride")) if config.get("anchor_stride", None) is not None else None
             ),
@@ -116,8 +126,11 @@ class EpisodeTeacherStore:
         self._episode_paths: dict[int, Path] = {}
         self._anchors: dict[int, torch.Tensor] = {}
         self._packed_features: torch.Tensor | None = None
+        self._packed_confidence: torch.Tensor | None = None
         self._packed_offsets: dict[int, int] = {}
         self._packed_counts: dict[int, int] = {}
+        self._packed_confidence_offsets: dict[int, int] = {}
+        self._packed_confidence_counts: dict[int, int] = {}
         packed_root = self.dataset_path / spec.packed_relative_dir if spec.packed_relative_dir else None
         if packed_root is not None:
             if not packed_root.is_dir():
@@ -181,6 +194,8 @@ class EpisodeTeacherStore:
                     )
             keys = set(reader.keys())
             required = {self.spec.feature_key, self.spec.anchor_key}
+            if self.spec.require_confidence:
+                required.add(self.spec.confidence_key)
             if not required.issubset(keys):
                 raise ValueError(f"Teacher file {path} is missing tensors {sorted(required - keys)}")
             features = reader.get_slice(self.spec.feature_key)
@@ -201,6 +216,27 @@ class EpisodeTeacherStore:
                 raise ValueError(
                     f"Teacher anchors mismatch in {path}: features={feature_shape}, anchors={anchor_shape}"
                 )
+            if self.spec.require_confidence:
+                confidence = reader.get_slice(self.spec.confidence_key)
+                confidence_shape = tuple(confidence.get_shape())
+                confidence_dtype = _canonical_dtype(confidence.get_dtype())
+                if confidence_shape != (feature_shape[0],):
+                    raise ValueError(
+                        f"Teacher confidence shape mismatch in {path}: expected [{feature_shape[0]}], "
+                        f"got {confidence_shape}"
+                    )
+                if self.spec.confidence_dtype is not None and confidence_dtype != _canonical_dtype(
+                    self.spec.confidence_dtype
+                ):
+                    raise ValueError(
+                        f"Teacher confidence dtype mismatch in {path}: got {confidence_dtype}, "
+                        f"expected {_canonical_dtype(self.spec.confidence_dtype)}"
+                    )
+                confidence_values = reader.get_tensor(self.spec.confidence_key).float()
+                if not torch.isfinite(confidence_values).all():
+                    raise ValueError(f"Teacher confidence must be finite in {path}")
+                if torch.any(confidence_values < 0.0) or torch.any(confidence_values > 1.0):
+                    raise ValueError(f"Teacher confidence must be within [0, 1] in {path}")
             if self.spec.feature_dtype is not None and feature_dtype != _canonical_dtype(
                 self.spec.feature_dtype
             ):
@@ -281,6 +317,42 @@ class EpisodeTeacherStore:
         self._packed_features = torch.from_file(
             str(features_path), shared=False, size=total_elements, dtype=dtype
         ).view(shape)
+        confidence_info = manifest.get("confidence")
+        if self.spec.require_confidence:
+            if not isinstance(confidence_info, dict):
+                raise ValueError(f"Packed teacher '{self.spec.name}' is missing confidence metadata")
+            confidence_path = packed_root / str(confidence_info.get("file", "confidence.bin"))
+            confidence_shape = tuple(confidence_info.get("shape", ()))
+            confidence_dtype_name = _canonical_dtype(confidence_info.get("dtype", ""))
+            if confidence_shape != (shape[0],):
+                raise ValueError(
+                    f"Packed teacher confidence shape mismatch: expected [{shape[0]}], got {confidence_shape}"
+                )
+            if self.spec.confidence_dtype is not None and confidence_dtype_name != _canonical_dtype(
+                self.spec.confidence_dtype
+            ):
+                raise ValueError(
+                    f"Packed teacher confidence dtype mismatch: got {confidence_dtype_name}, "
+                    f"expected {_canonical_dtype(self.spec.confidence_dtype)}"
+                )
+            confidence_dtype = {"float16": torch.float16, "float32": torch.float32}.get(
+                confidence_dtype_name
+            )
+            if confidence_dtype is None or not confidence_path.is_file():
+                raise FileNotFoundError(f"Packed teacher confidence file is missing: {confidence_path}")
+            expected_confidence_bytes = shape[0] * torch.empty((), dtype=confidence_dtype).element_size()
+            if confidence_path.stat().st_size != expected_confidence_bytes:
+                raise ValueError(
+                    "Packed teacher confidence file size mismatch: "
+                    f"got {confidence_path.stat().st_size}, expected {expected_confidence_bytes}"
+                )
+            self._packed_confidence = torch.from_file(
+                str(confidence_path), shared=False, size=shape[0], dtype=confidence_dtype
+            )
+            if not torch.isfinite(self._packed_confidence).all():
+                raise ValueError("Packed teacher confidence must be finite")
+            if torch.any(self._packed_confidence < 0.0) or torch.any(self._packed_confidence > 1.0):
+                raise ValueError("Packed teacher confidence must be within [0, 1]")
         for episode_id in requested:
             info = episodes[str(episode_id)]
             metadata = {str(key): str(value) for key, value in info.get("metadata", {}).items()}
@@ -298,6 +370,16 @@ class EpisodeTeacherStore:
             self._anchors[episode_id] = anchors
             self._packed_offsets[episode_id] = int(info["offset"])
             self._packed_counts[episode_id] = int(info["count"])
+            if self.spec.require_confidence:
+                self._packed_confidence_offsets[episode_id] = int(info.get("confidence_offset", -1))
+                self._packed_confidence_counts[episode_id] = int(info.get("confidence_count", -1))
+                if self._packed_confidence_counts[episode_id] != anchors.numel():
+                    raise ValueError(f"Packed teacher confidence count mismatch for episode {episode_id}")
+                if self._packed_confidence_offsets[episode_id] < 0 or (
+                    self._packed_confidence_offsets[episode_id] + self._packed_confidence_counts[episode_id]
+                    > shape[0]
+                ):
+                    raise ValueError(f"Packed teacher confidence offset is out of bounds for episode {episode_id}")
             if self._packed_counts[episode_id] != anchors.numel():
                 raise ValueError(f"Packed teacher count mismatch for episode {episode_id}")
             if self._packed_offsets[episode_id] < 0 or (
@@ -315,13 +397,16 @@ class EpisodeTeacherStore:
                 if not torch.equal(anchors, expected):
                     raise ValueError(f"Packed teacher anchors do not cover episode {episode_id}")
 
+    def _anchor_index(self, episode_id: int, frame_index: int) -> int:
+        anchors = self._anchors[int(episode_id)]
+        anchor_index = int(torch.searchsorted(anchors, int(frame_index), right=True).item()) - 1
+        return max(0, min(anchor_index, anchors.numel() - 1))
+
     def get(self, episode_id: int, frame_index: int) -> torch.Tensor:
         """返回离当前帧最近且不晚于当前帧的 teacher feature。"""
         if self._packed_features is not None:
             episode_id = int(episode_id)
-            anchors = self._anchors[episode_id]
-            anchor_index = int(torch.searchsorted(anchors, int(frame_index), right=True).item()) - 1
-            anchor_index = max(0, min(anchor_index, anchors.numel() - 1))
+            anchor_index = self._anchor_index(episode_id, frame_index)
             row = self._packed_offsets[episode_id] + anchor_index
             # A row view from torch.from_file is already contiguous, so
             # ``contiguous()`` would keep the entire mmap-backed storage.
@@ -330,12 +415,27 @@ class EpisodeTeacherStore:
             return self._packed_features[row].clone()
         path = self._episode_paths[int(episode_id)]
         with safe_open(path, framework="pt", device="cpu") as reader:
-            anchors = self._anchors[int(episode_id)]
-            # right=True 后减一得到 latest anchor <= frame_index；边界 clamp 也使
-            # 第一段共享区间和 episode 尾部都能稳定映射到已有 anchor。
-            anchor_index = int(torch.searchsorted(anchors, int(frame_index), right=True).item()) - 1
-            anchor_index = max(0, min(anchor_index, anchors.numel() - 1))
+            anchor_index = self._anchor_index(episode_id, frame_index)
             return reader.get_slice(self.spec.feature_key)[anchor_index].contiguous()
+
+    def get_with_confidence(self, episode_id: int, frame_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回同一 anchor 的 feature 与 confidence；仅供 confidence-aware 对齐使用。"""
+        if not self.spec.require_confidence:
+            raise RuntimeError("Teacher store was not configured to load confidence")
+        episode_id = int(episode_id)
+        anchor_index = self._anchor_index(episode_id, frame_index)
+        if self._packed_features is not None:
+            if self._packed_confidence is None:
+                raise RuntimeError("Packed teacher confidence was not loaded")
+            feature_row = self._packed_offsets[episode_id] + anchor_index
+            confidence_row = self._packed_confidence_offsets[episode_id] + anchor_index
+            return self._packed_features[feature_row].clone(), self._packed_confidence[confidence_row].clone()
+        path = self._episode_paths[episode_id]
+        with safe_open(path, framework="pt", device="cpu") as reader:
+            return (
+                reader.get_slice(self.spec.feature_key)[anchor_index].contiguous(),
+                reader.get_slice(self.spec.confidence_key)[anchor_index].clone(),
+            )
 
 
 def build_teacher_stores(

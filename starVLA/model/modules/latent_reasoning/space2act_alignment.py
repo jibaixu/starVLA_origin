@@ -60,7 +60,13 @@ class CrossAttentionLatentAligner(nn.Module):
     def compute_loss(
         self, compact_hidden: torch.Tensor, teachers: Sequence[torch.Tensor]
     ) -> torch.Tensor:
-        """分块搬运教师特征并计算按 token 归一化的 cosine + MSE 损失。"""
+        """返回传统的等权 batch mean，对旧配置保持兼容。"""
+        return self.compute_per_example_loss(compact_hidden, teachers).mean()
+
+    def compute_per_example_loss(
+        self, compact_hidden: torch.Tensor, teachers: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        """返回每个样本的 cosine + MSE alignment loss，shape 为 [B]。"""
         if compact_hidden.ndim != 3:
             raise ValueError(f"compact_hidden must be [B,K,H], got {tuple(compact_hidden.shape)}")
         if len(teachers) != compact_hidden.shape[0]:
@@ -71,8 +77,9 @@ class CrossAttentionLatentAligner(nn.Module):
                 raise ValueError(f"Expected teacher shape {expected}, got {tuple(teacher.shape)}")
 
         memory = self.memory_norm(self.memory_projection(compact_hidden))
-        cosine_sum = compact_hidden.new_zeros((), dtype=torch.float32)
-        mse_sum = compact_hidden.new_zeros((), dtype=torch.float32)
+        batch_size = compact_hidden.shape[0]
+        cosine_sum = compact_hidden.new_zeros((batch_size,), dtype=torch.float32)
+        mse_sum = compact_hidden.new_zeros((batch_size,), dtype=torch.float32)
         # teacher 通常是 CPU 上的大 tensor。按 query_chunk_size 预测和传输，避免一次
         # 将完整 [B,N,D_teacher] 目标及其计算图放入显存；分块不改变最终 loss 定义。
         for start in range(0, self.target_tokens, self.query_chunk_size):
@@ -85,12 +92,13 @@ class CrossAttentionLatentAligner(nn.Module):
             # 约束方向，MSE 作为较小权重的逐维补充。
             prediction = F.layer_norm(prediction, (self.target_dim,))
             teacher_chunk = F.layer_norm(teacher_chunk, (self.target_dim,))
-            cosine_sum = cosine_sum + (1.0 - F.cosine_similarity(prediction, teacher_chunk, dim=-1)).sum()
-            mse_sum = mse_sum + F.mse_loss(prediction, teacher_chunk, reduction="sum")
+            cosine_sum = cosine_sum + (1.0 - F.cosine_similarity(prediction, teacher_chunk, dim=-1)).sum(
+                dim=1
+            )
+            mse_sum = mse_sum + (prediction - teacher_chunk).square().sum(dim=(1, 2))
 
         # 显式按 batch/token（以及 MSE 的 feature dim）归一化，使 loss 尺度不随
         # 教师 token 数或维度变化，便于 S/F/P 通道使用统一 loss_weight。
-        batch_size = compact_hidden.shape[0]
-        cosine_loss = cosine_sum / (batch_size * self.target_tokens)
-        mse_loss = mse_sum / (batch_size * self.target_tokens * self.target_dim)
+        cosine_loss = cosine_sum / self.target_tokens
+        mse_loss = mse_sum / (self.target_tokens * self.target_dim)
         return cosine_loss + self.mse_weight * mse_loss

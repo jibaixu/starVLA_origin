@@ -27,6 +27,20 @@ framework:
     token_init_strategy: avg
     # 目标 query 较多时分块计算 cross-attention，以降低峰值显存。
     query_chunk_size: 128
+    # 仅在训练期按每个 anchor 的教师可靠性缩放 alignment 梯度；推理与 AISER 不读取它。
+    # min_weight=0 表示 confidence=0 的 target 完全不参与蒸馏，可按数据分布调整。
+    confidence_aware_alignment:
+      enabled: false
+      min_weight: 0.0
+      require_cached_confidence: true
+    # Action-anchored feature-level PCGrad; the independent training script
+    # enables it for the DWA + PCGrad ablation.
+    pcgrad:
+      enabled: false
+      trigger_cosine: -0.05
+      warmup_steps: 5000
+      epsilon: 1.0e-12
+      project_router: false
     # AISER 仅在 Stage 3 使用。启用后追加 A tokens，以当前 state 调制其 hidden，
     # 再从 S/F/P 中产生一次性 gated evidence slots 供 action head 复用。
     evidence_routing:
@@ -157,8 +171,11 @@ datasets:
           target_dim: ${framework.latent_reasoning.channels.spatial.target_dim}
           feature_key: features
           anchor_key: anchor_frames
+          confidence_key: confidence
           feature_dtype: bfloat16
           anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
           anchor_stride: 16
           validate_episode_length: true
           expected_metadata:
@@ -177,8 +194,11 @@ datasets:
           target_dim: ${framework.latent_reasoning.channels.future.target_dim}
           feature_key: features
           anchor_key: anchor_frames
+          confidence_key: confidence
           feature_dtype: bfloat16
           anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
           anchor_stride: 8
           validate_episode_length: true
           expected_metadata:
@@ -207,8 +227,11 @@ datasets:
           target_dim: ${framework.latent_reasoning.channels.plan.target_dim}
           feature_key: features
           anchor_key: anchor_frames
+          confidence_key: confidence
           feature_dtype: bfloat16
           anchor_dtype: int64
+          confidence_dtype: float32
+          require_confidence: ${framework.latent_reasoning.confidence_aware_alignment.enabled}
           anchor_stride: 1
           validate_episode_length: true
           expected_metadata:

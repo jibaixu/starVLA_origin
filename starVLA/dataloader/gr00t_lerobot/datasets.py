@@ -1441,10 +1441,20 @@ class LeRobotSingleDataset(Dataset):
         if self._teacher_stores:
             if trajectory_id is None or base_index is None:
                 raise ValueError("Teacher latents require trajectory_id and base_index when packing a sample")
-            sample["space2act_teacher"] = {
-                name: store.get(int(trajectory_id), int(base_index))
-                for name, store in self._teacher_stores.items()
-            }
+            teacher_values = {}
+            confidence_values = {}
+            for name, store in self._teacher_stores.items():
+                if store.spec.require_confidence:
+                    feature, confidence = store.get_with_confidence(
+                        int(trajectory_id), int(base_index)
+                    )
+                    teacher_values[name] = feature
+                    confidence_values[name] = confidence
+                else:
+                    teacher_values[name] = store.get(int(trajectory_id), int(base_index))
+            sample["space2act_teacher"] = teacher_values
+            if confidence_values:
+                sample["space2act_confidence"] = confidence_values
             sample["episode_index"] = int(trajectory_id)
             sample["frame_index"] = int(base_index)
 

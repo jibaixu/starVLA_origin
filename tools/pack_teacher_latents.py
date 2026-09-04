@@ -50,11 +50,13 @@ def pack(
             f"have {free_bytes} bytes"
         )
     temp_features = output / "features.bin.tmp"
+    temp_confidence = output / "confidence.bin.tmp"
     episodes = {}
     shape_tail = None
     dtype_name = None
     offset = 0
-    with temp_features.open("wb") as destination:
+    has_confidence: bool | None = None
+    with temp_features.open("wb") as feature_destination, temp_confidence.open("wb") as confidence_destination:
         for episode_id, path in paths:
             with safe_open(path, framework="pt", device="cpu") as reader:
                 metadata = {str(key): str(value) for key, value in (reader.metadata() or {}).items()}
@@ -68,26 +70,64 @@ def pack(
                     shape_tail, dtype_name = current_tail, current_dtype
                 if current_tail != shape_tail or current_dtype != dtype_name:
                     raise ValueError(f"Inconsistent packed shape/dtype in {path}")
+                current_has_confidence = "confidence" in reader.keys()
+                if has_confidence is None:
+                    has_confidence = current_has_confidence
+                elif current_has_confidence != has_confidence:
+                    raise ValueError("Teacher files must either all include confidence or all omit it")
+                confidence = None
+                if current_has_confidence:
+                    confidence = reader.get_tensor("confidence")
+                    if confidence.ndim != 1 or confidence.numel() != features.shape[0]:
+                        raise ValueError(f"Invalid confidence shape in {path}")
+                    if not torch.is_floating_point(confidence):
+                        raise ValueError(f"Teacher confidence must be floating point in {path}")
+                    confidence = confidence.float().contiguous()
+                    if not torch.isfinite(confidence).all():
+                        raise ValueError(f"Teacher confidence must be finite in {path}")
+                    if torch.any(confidence < 0.0) or torch.any(confidence > 1.0):
+                        raise ValueError(f"Teacher confidence must be within [0, 1] in {path}")
                 # bfloat16 has no portable numpy dtype; writing its uint16 view
                 # preserves every bit and torch.from_file restores the dtype.
                 if features.dtype == torch.bfloat16:
-                    features.view(torch.uint16).numpy().tofile(destination)
+                    features.view(torch.uint16).numpy().tofile(feature_destination)
                 else:
-                    features.numpy().tofile(destination)
+                    features.numpy().tofile(feature_destination)
                 episodes[str(episode_id)] = {
                     "offset": offset,
                     "count": int(features.shape[0]),
                     "anchors": [int(value) for value in anchors.tolist()],
                     "metadata": metadata,
                 }
+                if confidence is not None:
+                    confidence.numpy().tofile(confidence_destination)
+                    episodes[str(episode_id)].update(
+                        {
+                            "confidence_offset": offset,
+                            "confidence_count": int(confidence.numel()),
+                        }
+                    )
                 offset += int(features.shape[0])
     temp_features.replace(final_features)
+    final_confidence = output / "confidence.bin"
+    if has_confidence:
+        temp_confidence.replace(final_confidence)
+    else:
+        temp_confidence.unlink(missing_ok=True)
+        if force and final_confidence.exists():
+            final_confidence.unlink()
     manifest = {
-        "format": 1,
+        "format": 2 if has_confidence else 1,
         "dtype": dtype_name,
         "feature_shape": [offset, *shape_tail],
         "episodes": episodes,
     }
+    if has_confidence:
+        manifest["confidence"] = {
+            "file": "confidence.bin",
+            "dtype": "float32",
+            "shape": [offset],
+        }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return output
 
