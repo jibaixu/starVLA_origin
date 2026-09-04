@@ -195,13 +195,12 @@ class QwenSpace2Act_VLM(baseframework):
         self.gradnorm_window_probes = 0
 
     def _gradnorm_ramp_factor(self, training_step: int) -> float:
-        warmup_steps = int(self.gradnorm_config["warmup_steps"])
-        if training_step <= warmup_steps:
+        if training_step <= 0:
             return 0.0
         ramp_steps = int(self.gradnorm_config.get("adaptive_weight_ramp_steps", 0))
         if ramp_steps <= 0:
             return 1.0
-        progress = min(1.0, (training_step - warmup_steps) / ramp_steps)
+        progress = min(1.0, training_step / ramp_steps)
         return 0.5 * (1.0 - math.cos(math.pi * progress))
 
     def _effective_alignment_weights(self, training_step: int | None) -> dict[str, float]:
@@ -257,7 +256,7 @@ class QwenSpace2Act_VLM(baseframework):
         previous_weights = dict(self.gradnorm_weights)
         step = int(training_step)
         updated = False
-        if should_update and step > int(self.gradnorm_config["warmup_steps"]):
+        if should_update:
             if gradient_norms:
                 if any(channel not in gradient_norms for channel in self.gradnorm_channels):
                     raise ValueError("VLM-only GradNorm probe is missing an alignment channel")
@@ -278,7 +277,7 @@ class QwenSpace2Act_VLM(baseframework):
                 self.gradnorm_window_probes += 1
 
             update_interval = int(self.gradnorm_config["gradient_update_interval"])
-            if (step - int(self.gradnorm_config["warmup_steps"])) % update_interval == 0:
+            if step % update_interval == 0:
                 expected_probes = update_interval // int(self.gradnorm_config["gradient_probe_interval"])
                 if self.gradnorm_window_probes == expected_probes and all(
                     self.gradnorm_gradient_ema[channel] is not None for channel in self.gradnorm_channels
@@ -436,9 +435,7 @@ class QwenSpace2Act_VLM(baseframework):
             self.gradnorm_enabled
             and run_gradient_probe
             and training_step is not None
-            and int(training_step) > int(self.gradnorm_config["warmup_steps"])
-            and (int(training_step) - int(self.gradnorm_config["warmup_steps"]))
-            % int(self.gradnorm_config["gradient_probe_interval"])
+            and int(training_step) % int(self.gradnorm_config["gradient_probe_interval"])
             == 0
         ):
             losses.update(self._compute_gradnorm_probe(last_hidden, channel_losses))

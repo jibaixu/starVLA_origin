@@ -134,7 +134,6 @@ def normalize_gradnorm_config(schedule_cfg, active_channels) -> dict[str, float 
         "gradient_ema_decay": finite("gradient_ema_decay", 0.9, 0.0, 1.0),
         "gradient_probe_interval": probe_interval,
         "gradient_update_interval": update_interval,
-        "warmup_steps": nonnegative_int("warmup_steps", 5000),
         "adaptive_weight_ramp_steps": nonnegative_int("adaptive_weight_ramp_steps", 0),
     }
 
