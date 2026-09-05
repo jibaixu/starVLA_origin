@@ -17,6 +17,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import ModelClient
+from examples.simBenchmarks.LIBERO.eval_files.auto_eval_scripts.collect_libero_eval_results import write_json_atomic
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -67,6 +68,9 @@ class Args:
 
     pretrained_path: str = ""
 
+    # Optional per-suite result sidecar consumed by run_auto_eval_libero.sh.
+    result_json: str = ""
+
     # Dataset key for un-normalization. None = auto (only if model trained on a single dataset).
     unnorm_key: str | None = None
 
@@ -77,7 +81,7 @@ class Args:
     job_name: str = "test"
 
 
-def eval_libero(args: Args) -> None:
+def eval_libero(args: Args) -> dict:
     logging.info(f"Arguments: {json.dumps(dataclasses.asdict(args), indent=4)}")
 
     # Set random seed
@@ -255,8 +259,27 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    success_rate = total_successes / total_episodes if total_episodes else None
+    logging.info(f"Total success rate: {success_rate}")
     logging.info(f"Total episodes: {total_episodes}")
+    summary = {
+        "status": "completed",
+        "checkpoint": str(pathlib.Path(args.pretrained_path)),
+        "task_suite": args.task_suite_name,
+        "evaluation": {
+            "seed": args.seed,
+            "num_trials_per_task": args.num_trials_per_task,
+            "max_tasks": args.max_tasks,
+            "include_state": args.include_state,
+        },
+        "total_successes": total_successes,
+        "total_episodes": total_episodes,
+        "success_rate": success_rate,
+    }
+    if args.result_json:
+        write_json_atomic(args.result_json, summary)
+        logging.info(f"Evaluation result saved to {args.result_json}")
+    return summary
 
 
 def _get_libero_env(task, resolution, seed):
