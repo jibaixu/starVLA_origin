@@ -1,0 +1,72 @@
+# Frozen original Qwen + fixed mean-initialized S/P/F token scaffold baseline.
+run_id: action_head_raw_qwen_spf_libero
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: jinhuiye
+wandb_project: starVLA_Libero
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenSpace2ActActionHead
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    action_horizon: 8
+    repeated_diffusion_steps: 8
+  latent_reasoning:
+    routing_mode: native_causal
+    token_order: spatial_instruction_plan_future
+    token_init_strategy: avg
+    channels:
+      spatial: {token_enabled: true, token_count: 32, alignment_enabled: false, target_tokens: 1521, target_dim: 5120}
+      future: {token_enabled: true, token_count: 32, alignment_enabled: false, target_tokens: 1125, target_dim: 3072}
+      plan: {token_enabled: true, token_count: 32, alignment_enabled: false, target_tokens: 32, target_dim: 32}
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_all
+    seed: 42
+    include_state: true
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    num_workers: 8
+    persistent_workers: true
+    mp_sharing_strategy: default
+    episode_indices: null
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs: {min_lr: 1.0e-06}
+  pretrained_checkpoint: ""
+  reload_modules: ""
+  freeze_modules: qwen_vl_interface
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  save_format: pt
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

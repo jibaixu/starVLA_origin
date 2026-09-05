@@ -154,6 +154,46 @@ class Space2ActTwoStageConfigTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_raw_qwen_action_head_baseline_uses_original_frozen_qwen(self):
+        cfg = self._load("action_head_raw_qwen_libero.yaml")
+        self.assertEqual(cfg.framework.name, "QwenGR00T")
+        self.assertEqual(cfg.framework.qwenvl.base_vlm, "./playground/Pretrained_models/Qwen3-VL-4B-Instruct")
+        self.assertEqual(cfg.trainer.pretrained_checkpoint, "")
+        self.assertEqual(cfg.trainer.reload_modules, "")
+        self.assertEqual(cfg.trainer.freeze_modules, "qwen_vl_interface")
+        self.assertNotIn("latent_reasoning", cfg.framework)
+
+        source = (
+            self.repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_action_head_raw_qwen_baseline.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--framework.name QwenGR00T", source)
+        self.assertIn('--trainer.pretrained_checkpoint ""', source)
+        self.assertIn('--trainer.reload_modules ""', source)
+        self.assertIn("--trainer.freeze_modules qwen_vl_interface", source)
+        self.assertNotIn("VLM_CHECKPOINT", source)
+
+    def test_raw_qwen_spf_baseline_has_fixed_tokens_without_transfer(self):
+        cfg = self._load("action_head_raw_qwen_spf_libero.yaml")
+        self.assertEqual(cfg.framework.name, "QwenSpace2ActActionHead")
+        self.assertEqual(cfg.framework.latent_reasoning.token_init_strategy, "avg")
+        self.assertEqual(cfg.trainer.pretrained_checkpoint, "")
+        self.assertEqual(cfg.trainer.reload_modules, "")
+        self.assertEqual(cfg.trainer.freeze_modules, "qwen_vl_interface")
+        for channel in cfg.framework.latent_reasoning.channels.values():
+            self.assertTrue(channel.token_enabled)
+            self.assertFalse(channel.alignment_enabled)
+
+        source = (
+            self.repo_root
+            / "examples/simBenchmarks/LIBERO/train_files/run_action_head_raw_qwen_spf_baseline.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--framework.name QwenSpace2ActActionHead", source)
+        self.assertIn('--trainer.pretrained_checkpoint ""', source)
+        self.assertIn('--trainer.reload_modules ""', source)
+        self.assertIn("--trainer.freeze_modules qwen_vl_interface", source)
+        self.assertNotIn("VLM_CHECKPOINT", source)
+
 
 if __name__ == "__main__":
     unittest.main()

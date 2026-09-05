@@ -58,3 +58,22 @@ VLM_CHECKPOINT=playground/Checkpoints/space2act_libero_vlm_distill_spf/final_mod
 `.safetensors`，也可将每个 channel 的 `packed_relative_dir` 指向
 `manifest.json + features.bin`（可选 `confidence.bin`）的 mmap-packed 缓存。Action Head
 配置不含 `teacher_latents`，因此不要求任何教师文件存在。
+
+## 原始 Qwen Action Head Baselines
+
+为区分 action head 本身、固定 token scaffold 和 VLM 蒸馏的贡献，提供两套同 seed（42）的
+baseline。二者都冻结 `qwen_vl_interface`，只训练 `action_model`，不加载阶段一 checkpoint：
+
+```bash
+bash examples/simBenchmarks/LIBERO/train_files/run_action_head_raw_qwen_baseline.sh
+bash examples/simBenchmarks/LIBERO/train_files/run_action_head_raw_qwen_spf_baseline.sh
+```
+
+`run_action_head_raw_qwen_baseline.sh` 使用 `QwenGR00T`，输入只有图像和 instruction，不注册
+S/P/F token，是主要的原始 Qwen baseline。`run_action_head_raw_qwen_spf_baseline.sh` 使用
+`QwenSpace2ActActionHead`，从原始 Qwen 词表均值初始化并冻结 S/P/F token；它不包含蒸馏语义，
+但可测量固定 token scaffold 对 causal hidden states 和 action head 的影响，因此作为辅助消融。
+
+两条脚本均支持通过环境变量覆盖 `BASE_VLM`、`LIBERO_DATA_ROOT`、`RUN_ROOT_DIR`、`RUN_ID`、
+`MAX_TRAIN_STEPS`、`SAVE_INTERVAL`、`NUM_PROCESSES`，并可设置 `DRY_RUN=1` 检查展开后的命令。
+产出的 checkpoint 可直接填入 `run_auto_eval_libero.sh` 的 `CKPT_LIST`。
