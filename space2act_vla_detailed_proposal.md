@@ -10,7 +10,7 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 第一版采用以下经过显存与扩展性权衡后的设计：
 
 - 三组 S/F/P token 从 Stage 1 起全部注册到 tokenizer（默认每组 32 个），确保各阶段词表和 checkpoint shape 稳定；只有 `token_enabled` 的组被插入序列。
-- 序列沿用 Qwen 原生 causal attention；legacy 顺序为 `images -> S -> instruction -> F -> P`，AISER 开启后追加未直接接受教师监督的 A tokens，形成 `images -> S -> instruction -> F -> P -> A`。
+- 序列沿用 Qwen 原生 causal attention；联合训练主顺序为 `images -> S -> instruction -> P -> F`，AISER 开启后追加未直接接受教师监督的 A tokens，形成 `images -> S -> instruction -> P -> F -> A`。旧 `F -> P` 顺序仍可作为 legacy 对照，但不能用于宣称 F 读取 P。
 - 学生侧每个通道只有 32 个 compact token。训练期 mapper 使用与教师 token 数相同的 learned queries，通过 cross-attention 读取 compact hidden，再映射到教师维度；推理完全跳过 mapper。
 - Stage 1 的 LingBot 监督是 `[1521, 5120]`，mapper 为 `32 x 2560 -> 1521 x 5120`，内部维度 1024、8 heads、query chunk 128。
 - Stage 2 的 Wan2.2-TI2V-5B 监督是 `[1125, 3072]`：抓取 20-step rollout 的 final positive denoise step（zero-based step 19）、zero-based block 20 hidden，token 顺序为 `5 x 15 x 15` 的 T-H-W 展平。future mapper 为 `32 x 2560 -> 1125 x 3072`，同样使用 1024 内部维度、8 heads 和 query chunk 128。
@@ -19,12 +19,14 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 - 已实现可选 Confidence-Aware alignment：每个 channel 的 teacher cache 可保存 K=4 次推理的均值 target，以及与 anchor 对齐的 `confidence[A]` 标量；训练时仅用 confidence 缩放对应 alignment loss，默认 `min_weight=0.0`，不改变 action loss 或 AISER 的输入。
 - `token_enabled` 与 `alignment_enabled` 独立，支持同 token 数无 teacher loss 的 random-token control。
 - AISER 使用 proprio-state-conditioned A hidden 对 S/F/P 分别执行 token attention，默认生成 `3 x 8` 个连续 gated evidence slots；原始 S/F/P/A 不再直接作为 ActionHead KV。路由只使用 student hidden，推理不读取教师 tensor，并在所有 flow-matching denoising step 间复用一次结果。
+- 联合训练新增可选 Causal Dynamics Bottleneck（CDB）：在共享 256 维 dynamics space 中构造 `S + gated_delta(S,P,q) -> F` 残差转移，并可加入逆向 `S,F -> P` 结构方程、batch 内 P intervention ranking 和 variance 防坍塌正则。CDB 只读取 student S/P/F hidden，推理路径完全跳过。
 - Stage 1/2/3 的 legacy 课程迁移、严格 teacher loader、三教师训练入口和 teacher-free LIBERO 评估入口已经实现。另有独立 progressive、DWA、GradNorm 和 Confidence-Aware + GradNorm 入口：从第 0 步固定 S/F/P 序列，在单次 100k optimizer 轨迹中调度教师权重或 confidence-aware alignment。
 
 对应实现入口为：
 
 - `starVLA/model/framework/VLM4A/QwenSpace2ActGR00T.py`
 - `starVLA/model/modules/latent_reasoning/space2act_alignment.py`
+- `starVLA/model/modules/latent_reasoning/space2act_dynamics.py`
 - `starVLA/model/modules/latent_reasoning/action_evidence_router.py`
 - `examples/simBenchmarks/LIBERO/train_files/space2act_libero_state.yaml`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_train.sh`
@@ -33,6 +35,7 @@ proprio state。Stage 3 新增可选 AISER 路径，在进入 ActionHead 前自�
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_dwa_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_gradnorm_train.sh`
 - `examples/simBenchmarks/LIBERO/train_files/run_space2act_confidence_aware_gradnorm_train.sh`
+- `examples/simBenchmarks/LIBERO/train_files/run_space2act_cdb_confidence_aware_gradnorm_pcgrad_train.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/run_auto_eval_libero.sh`
 - `examples/simBenchmarks/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall_jbx.sh`
 
@@ -127,7 +130,7 @@ $$
 主输入序列为：
 
 $$
-X_t = [V(o_t, q_t) \;|\; S \;|\; L(\ell) \;|\; F \;|\; P],
+X_t = [V(o_t, q_t) \;|\; S \;|\; L(\ell) \;|\; P \;|\; F],
 $$
 
 其中 $V(o_t)$ 表示 Qwen processor 生成的视觉 token；当前实现不把 $q_t$ 拼入 Qwen 序列，而是沿用 base contract 将 proprio state 独立输入 GR00T ActionHead。
@@ -182,12 +185,12 @@ Continuous action chunk
 
 ### 2.3 第一版 causal routing 与后续 block-mask 消融
 
-第一版不修改 Qwen3-VL 内部 attention 实现，直接使用其原生 causal mask。通过 token 的物理排布表达“当前感知 -> 空间理解 -> 未来推演 -> 动作计划”的顺序：
+第一版不修改 Qwen3-VL 内部 attention 实现，直接使用其原生 causal mask。通过 token 的物理排布表达“当前感知 -> 空间理解 -> 动作计划 -> 未来推演”的顺序：
 
-设 token block 顺序为：
+联合训练主实验的 token block 顺序为：
 
 $$
-V \prec S \prec L \prec F \prec P \prec A,
+V \prec S \prec L \prec P \prec F \prec A,
 $$
 
 其中 $A$ 不属于 Qwen token 序列，而是 GR00T ActionHead 中读取完整 Qwen hidden states 的动作查询。原生 causal mask 定义为：
@@ -209,9 +212,9 @@ $$
 | $V$ | 先前视觉位置 | 保持 Qwen 原生多模态 causal 行为 |
 | $S$ | $V, S$ | 学习任务无关或弱任务相关的 3D 空间结构 |
 | $L$ | $V, S, L$ | 让语言理解可以读取空间结构，避免纯文本解释场景 |
-| $F$ | $V, S, L, F$ | 基于当前视觉、空间关系和语言任务推演未来变化 |
-| $P$ | $V, S, L, F, P$ | 基于空间与未来推演形成潜在动作计划 |
-| $A$ | $V, S, L, F, P, A$ | 动作头读取完整潜在推理结果 |
+| $P$ | $V, S, L, P$ | 基于当前视觉、空间关系和语言任务形成潜在动作计划 |
+| $F$ | $V, S, L, P, F$ | 基于当前视觉、空间关系和动作计划推演未来变化 |
+| $A$ | $V, S, L, P, F, A$ | 动作头读取完整潜在推理结果 |
 
 同一 latent block 在当前实现中也是 causal 的，不额外改成双向 set attention。ActionHead 对有效 Qwen KV 使用 cross-attention，因此能读取视觉、指令和所有已启用 reasoning token。
 
@@ -377,7 +380,41 @@ $$
 
 这会让动作规划 token 学到“这个高层运动计划应该导致什么未来变化”，避免 $P$ token 退化成 action head 的额外容量。
 
-### 2.7 Action-Intent-Guided Sparse Evidence Routing
+### 2.7 Causal Dynamics Bottleneck
+
+原生 causal attention 只规定可见性，不保证 `F` 学到“空间状态经过运动计划后如何变化”。联合训练因此在 student hidden 上增加一个不参与推理的显式动力学瓶颈。首先将三类 32-token hidden pooling 到共享 dynamics space：
+
+$$
+z_S=E_S(H_S),\quad z_P=E_P(H_P),\quad z_F=E_F(H_F).
+$$
+
+主转移采用残差形式：
+
+$$
+\Delta z_F=D(z_S,z_P,q),\qquad
+\hat z_F=z_S+\sigma(G(z_S,z_P,q))\odot\Delta z_F.
+$$
+
+并以 stop-gradient 的 $z_F$ 作为目标。Hybrid CDB 另外加入逆向结构方程
+
+$$
+\hat z_P=I(z_S,z_F,q),
+$$
+
+以及 batch 内交换 $P$ 的 intervention ranking，要求正确的 $(S_i,P_i,F_i)$ 配对优于 $(S_i,P_j,F_i)$。该约束只使用当前 batch 的 student hidden，不需要新增 teacher cache。variance floor 防止共享 dynamics space 坍塌。
+
+联合损失增加：
+
+$$
+\mathcal L_{CDB}=\lambda_r\mathcal L_{res}
++\lambda_e\mathcal L_{eq}
++\lambda_i\mathcal L_{do(P)}
++\lambda_v\mathcal L_{var}.
+$$
+
+CDB 在前 5k optimizer steps 关闭，再用 15k steps cosine ramp；推理时跳过 CDB、mapper 和 teacher，仅保留原有 Qwen + ActionHead。CDB 是结构化因果归纳偏置，不应被表述为仅凭 observational demonstrations 得到的严格因果识别。
+
+### 2.8 Action-Intent-Guided Sparse Evidence Routing
 
 直接把全部 $H_S,H_F,H_P$ 作为 ActionHead KV，会假设每个 action chunk 在任何执行状态下都
 同等需要所有教师塑形后的 token。AISER 改为引入 $N_A=8$ 个未直接接受教师对齐的 Action
@@ -454,6 +491,7 @@ $$
 + \lambda_{SF}\mathcal{L}_{SF}
 + \lambda_{FP}\mathcal{L}_{FP}
 + \lambda_{role}\mathcal{L}_{role}
++ \mathcal{L}_{CDB}
 + \mathcal{L}_{route}.
 $$
 
@@ -752,7 +790,7 @@ loss 只作为诊断指标。
 - $N_s, N_f, N_p$ 的数量扫描，例如 4/8/16/32；
 - 三类 token 是否共享 embedding；
 - 是否使用 role type embedding；
-- latent token 放置顺序：`V-S-L-F-P` vs `V-L-S-F-P` vs 并列无顺序；
+- latent token 放置顺序：`V-S-L-P-F` vs legacy `V-S-L-F-P` vs 并列无顺序；
 - block-wise causal mask vs full attention；
 - 同 block 内双向 self-attention vs 严格 causal attention。
 

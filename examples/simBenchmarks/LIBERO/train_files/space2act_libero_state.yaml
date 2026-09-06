@@ -20,14 +20,27 @@ framework:
   latent_reasoning:
     # Stage 1/2/3 由启动脚本覆盖；写入 checkpoint config 后用于校验课程热启动。
     stage: 1
-    # 当前实现沿用 Qwen 原生因果掩码。旧端到端实验保留 F -> P 顺序；
-    # 两阶段蒸馏配置显式覆盖为 S -> instruction -> P -> F。
+    # 当前实现沿用 Qwen 原生因果掩码，默认保持既有训练入口的顺序
+    # S -> instruction -> F -> P。CDB 联合训练脚本显式覆盖为 S -> instruction -> P -> F。
     routing_mode: native_causal
     token_order: spatial_instruction_future_plan
     # avg 用现有词表均值初始化新增 token；normal 可用于随机 token 对照实验。
     token_init_strategy: avg
     # 目标 query 较多时分块计算 cross-attention，以降低峰值显存。
     query_chunk_size: 128
+    # CDB 仅在 Stage 3 三通道联合训练脚本中显式开启；Stage 1/2 保持关闭。
+    dynamics_bottleneck:
+      enabled: false
+      mode: hybrid
+      dim: 256
+      forward_weight: 0.05
+      inverse_weight: 0.03
+      intervention_weight: 0.02
+      variance_weight: 0.005
+      warmup_steps: 5000
+      ramp_steps: 15000
+      margin: 0.1
+      variance_floor: 0.05
     # 仅在训练期按每个 anchor 的教师可靠性缩放 alignment 梯度；推理与 AISER 不读取它。
     # min_weight=0 表示 confidence=0 的 target 完全不参与蒸馏，可按数据分布调整。
     confidence_aware_alignment:

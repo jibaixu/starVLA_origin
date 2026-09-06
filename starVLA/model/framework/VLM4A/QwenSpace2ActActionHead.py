@@ -71,14 +71,14 @@ class QwenSpace2Act_ActionHead(Qwen_GR00T):
             latent_cfg.channels,
             init_strategy=str(latent_cfg.get("token_init_strategy", "avg")),
             action_token_count=0,
-            token_order=str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            token_order=str(latent_cfg.get("token_order", "spatial_instruction_plan_future")),
         )
 
     def space2act_layout(self) -> dict:
         latent_cfg = self.config.framework.latent_reasoning
         return {
             "base_vlm": str(self.config.framework.qwenvl.base_vlm),
-            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_plan_future")),
             "channels": {
                 channel: int(latent_cfg.channels[channel].token_count)
                 for channel in SPACE2ACT_CHANNELS

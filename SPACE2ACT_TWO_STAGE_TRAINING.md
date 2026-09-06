@@ -3,6 +3,11 @@
 本目录的两阶段路径将 Space2Act 训练拆为 VLM 潜在蒸馏和冻结 VLM 的 Action Head 训练。
 二者均复用 LIBERO LeRobot 数据、图像/语言输入、episode/frame 对齐和教师 latent cache。
 
+联合训练新增的 Causal Dynamics Bottleneck（CDB）不属于本两阶段路径：它需要 action loss
+与 S/P/F 三路 hidden 同时存在，因此只在 `QwenSpace2ActGR00T` 的 Stage 3 joint script 中
+通过 `dynamics_bottleneck.enabled=true` 开启。两阶段基线保持关闭，用于区分冻结 VLM 的
+性能影响与联合动力学约束的收益。
+
 ## 阶段一：VLM 潜在蒸馏
 
 `QwenSpace2ActVLM` 只构造 Qwen、S/P/F typed token 和三路 alignment mapper；不构造

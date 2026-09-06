@@ -19,6 +19,7 @@ from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig, Qwen_GR00T
 from starVLA.model.modules.latent_reasoning import (
     ActionGuidedEvidenceRouter,
+    CausalDynamicsBottleneck,
     CrossAttentionLatentAligner,
 )
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -73,6 +74,47 @@ def _normalize_pcgrad_config(config) -> dict[str, float | int | bool]:
         "epsilon": epsilon,
         # Router regularizers are deliberately kept outside the PCGrad task set.
         "project_router": project_router,
+    }
+
+
+def _normalize_dynamics_bottleneck_config(config) -> dict[str, float | int | bool | str]:
+    """Validate the joint-training causal dynamics bottleneck configuration."""
+    config = config or {}
+    enabled = _is_enabled(config.get("enabled", False))
+    mode = str(config.get("mode", "hybrid")).lower()
+    if mode not in {"residual", "structural", "hybrid"}:
+        raise ValueError("dynamics_bottleneck mode must be residual, structural, or hybrid")
+
+    def finite_float(name: str, default: float, minimum: float) -> float:
+        value = float(config.get(name, default))
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError(f"dynamics_bottleneck {name} must be finite and >= {minimum}")
+        return value
+
+    def positive_int(name: str, default: int) -> int:
+        value = config.get(name, default)
+        if isinstance(value, bool) or int(value) != float(value) or int(value) <= 0:
+            raise ValueError(f"dynamics_bottleneck {name} must be a positive integer")
+        return int(value)
+
+    warmup_steps = config.get("warmup_steps", 5000)
+    ramp_steps = config.get("ramp_steps", 15000)
+    for name, value in (("warmup_steps", warmup_steps), ("ramp_steps", ramp_steps)):
+        if isinstance(value, bool) or int(value) != float(value) or int(value) < 0:
+            raise ValueError(f"dynamics_bottleneck {name} must be a non-negative integer")
+
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "dim": positive_int("dim", 256),
+        "forward_weight": finite_float("forward_weight", 0.05, 0.0),
+        "inverse_weight": finite_float("inverse_weight", 0.03, 0.0),
+        "intervention_weight": finite_float("intervention_weight", 0.02, 0.0),
+        "variance_weight": finite_float("variance_weight", 0.005, 0.0),
+        "warmup_steps": int(warmup_steps),
+        "ramp_steps": int(ramp_steps),
+        "margin": finite_float("margin", 0.1, 0.0),
+        "variance_floor": finite_float("variance_floor", 0.05, 0.0),
     }
 
 
@@ -343,9 +385,24 @@ class QwenSpace2ActGR00TDefaultConfig(QwenGR00TDefaultConfig):
             "routing_mode": "native_causal",
             # Kept explicit because token order changes the causal computation and
             # therefore must be checked when transferring a distilled VLM.
-            "token_order": "spatial_instruction_future_plan",
+            "token_order": "spatial_instruction_plan_future",
             "token_init_strategy": "avg",
             "query_chunk_size": 128,
+            # Joint Stage 3 scripts explicitly enable this only when all S/P/F
+            # banks are present.  Keeping the default disabled preserves Stage 1/2.
+            "dynamics_bottleneck": {
+                "enabled": False,
+                "mode": "hybrid",
+                "dim": 256,
+                "forward_weight": 0.05,
+                "inverse_weight": 0.03,
+                "intervention_weight": 0.02,
+                "variance_weight": 0.005,
+                "warmup_steps": 5000,
+                "ramp_steps": 15000,
+                "margin": 0.1,
+                "variance_floor": 0.05,
+            },
             "confidence_aware_alignment": {
                 "enabled": False,
                 "min_weight": 0.0,
@@ -403,9 +460,32 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             latent_cfg.channels,
             init_strategy=str(latent_cfg.token_init_strategy),
             action_token_count=action_token_count,
-            token_order=str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            token_order=str(latent_cfg.get("token_order", "spatial_instruction_plan_future")),
         )
         hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
+        self.dynamics_config = _normalize_dynamics_bottleneck_config(
+            latent_cfg.get("dynamics_bottleneck", {})
+        )
+        self.dynamics_bottleneck = None
+        if self.dynamics_config["enabled"]:
+            missing = [
+                channel
+                for channel in _SPACE2ACT_CHANNELS
+                if not _is_enabled(latent_cfg.channels[channel].get("token_enabled", False))
+            ]
+            if missing:
+                raise ValueError(
+                    "dynamics_bottleneck requires spatial/future/plan tokens; disabled="
+                    f"{missing}"
+                )
+            self.dynamics_bottleneck = CausalDynamicsBottleneck(
+                hidden_dim=hidden_dim,
+                state_dim=int(self.config.framework.action_model.get("state_dim", 0)),
+                dynamics_dim=int(self.dynamics_config["dim"]),
+                mode=str(self.dynamics_config["mode"]),
+                margin=float(self.dynamics_config["margin"]),
+                variance_floor=float(self.dynamics_config["variance_floor"]),
+            )
         self.evidence_router_loss_weights = {}
         self.replace_routed_typed_tokens = True
         if self.evidence_routing_enabled:
@@ -520,7 +600,7 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         latent_cfg = self.config.framework.latent_reasoning
         return {
             "base_vlm": str(self.config.framework.qwenvl.base_vlm),
-            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_plan_future")),
             "channels": {
                 channel: int(latent_cfg.channels[channel].token_count)
                 for channel in _SPACE2ACT_CHANNELS
@@ -734,6 +814,20 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         if training_step is None:
             raise ValueError("training_step is required when Space2Act loss_schedule is enabled")
         return _interpolate_loss_schedule(self.loss_schedule_knots, training_step)
+
+    def _dynamics_loss_scale(self, training_step: int | None) -> float:
+        """Warm up the causal bottleneck without changing legacy loss schedules."""
+        if self.dynamics_bottleneck is None:
+            return 0.0
+        step = 0 if training_step is None else max(0, int(training_step))
+        warmup = int(self.dynamics_config["warmup_steps"])
+        ramp_steps = int(self.dynamics_config["ramp_steps"])
+        if step <= warmup:
+            return 0.0
+        if ramp_steps <= 0:
+            return 1.0
+        progress = min(1.0, (step - warmup) / ramp_steps)
+        return 0.5 * (1.0 - math.cos(math.pi * progress))
 
     def _confidence_weighted_alignment_loss(
         self, per_example_loss: torch.Tensor, confidence: torch.Tensor
@@ -1428,9 +1522,64 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             )
             last_hidden = outputs.hidden_states[-1]
 
+        state_tensor = None
+        if state is not None:
+            state_tensor = torch.tensor(
+                np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+            )
+
+        dynamics_loss = last_hidden.new_zeros((), dtype=torch.float32)
+        dynamics_scale = self._dynamics_loss_scale(training_step)
+        if self.dynamics_bottleneck is not None and dynamics_scale > 0.0:
+            dynamics_positions = {
+                channel: self._typed_positions(qwen_inputs["input_ids"], channel)
+                for channel in _SPACE2ACT_CHANNELS
+            }
+            dynamics_hidden = {
+                channel: self._typed_hidden(
+                    qwen_inputs["input_ids"],
+                    last_hidden,
+                    channel,
+                    positions=dynamics_positions[channel],
+                )
+                for channel in _SPACE2ACT_CHANNELS
+            }
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                dynamics_output = self.dynamics_bottleneck(dynamics_hidden, state=state_tensor)
+            component_weights = {
+                "residual_loss": float(self.dynamics_config["forward_weight"]),
+                "structural_loss": float(self.dynamics_config["inverse_weight"]),
+                "intervention_loss": float(self.dynamics_config["intervention_weight"]),
+                "variance_loss": float(self.dynamics_config["variance_weight"]),
+            }
+            dynamics_loss = dynamics_scale * sum(
+                weight * dynamics_output[name]
+                for name, weight in component_weights.items()
+            )
+            losses = {
+                "dynamics_loss": dynamics_loss,
+                "dynamics_loss_scale": last_hidden.new_tensor(dynamics_scale, dtype=torch.float32),
+                "dynamics/intervention_margin": dynamics_output["intervention_margin"].detach(),
+            }
+            for name, weight in component_weights.items():
+                losses[f"dynamics/{name}"] = dynamics_output[name].detach()
+                losses[f"dynamics/weighted_{name}"] = (
+                    dynamics_scale * weight * dynamics_output[name]
+                ).detach()
+        elif self.dynamics_bottleneck is not None:
+            losses = {
+                "dynamics_loss": dynamics_loss,
+                "dynamics_loss_scale": last_hidden.new_tensor(dynamics_scale, dtype=torch.float32),
+                "dynamics/intervention_margin": dynamics_loss,
+            }
+            for name in ("residual_loss", "structural_loss", "intervention_loss", "variance_loss"):
+                losses[f"dynamics/{name}"] = dynamics_loss
+                losses[f"dynamics/weighted_{name}"] = dynamics_loss
+        else:
+            losses = {}
+
         # 逐通道计算教师对齐损失。teacher tensor 保持在 CPU，aligner 内部按 query
         # chunk 搬到 GPU，从而限制 1521x5120 等大目标的瞬时显存占用。
-        losses = {}
         total_alignment_loss = last_hidden.new_zeros((), dtype=torch.float32)
         channel_losses = {}
         channel_positions = {}
@@ -1513,11 +1662,6 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
             channel_losses[channel] = channel_loss
             channel_positions[channel] = positions
 
-        state_tensor = None
-        if state is not None:
-            state_tensor = torch.tensor(
-                np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
-            )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             action_context, action_context_mask, router_metrics = self._build_action_context(
                 qwen_inputs["input_ids"],
@@ -1614,7 +1758,9 @@ class QwenSpace2Act_GR00T(Qwen_GR00T):
         # trainer 优先反传 total_loss；同时保留分项，便于独立观察 action 与各教师损失。
         losses["action_loss"] = action_loss
         losses["alignment_loss"] = total_alignment_loss
-        losses["total_loss"] = action_loss + total_alignment_loss + router_auxiliary_loss
+        losses["total_loss"] = (
+            action_loss + total_alignment_loss + router_auxiliary_loss + dynamics_loss
+        )
         return losses
 
     @torch.inference_mode()

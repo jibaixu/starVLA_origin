@@ -141,7 +141,7 @@ class QwenSpace2Act_VLM(baseframework):
             raise ValueError(f"VLM-only {schedule_mode} loss_schedule requires enabled=true")
 
         self.qwen_vl_interface = get_vlm_model(config=self.config)
-        token_order = str(latent_cfg.get("token_order", "spatial_instruction_future_plan"))
+        token_order = str(latent_cfg.get("token_order", "spatial_instruction_plan_future"))
         self.qwen_vl_interface.configure_space2act_tokens(
             latent_cfg.channels,
             init_strategy=str(latent_cfg.get("token_init_strategy", "avg")),
@@ -350,7 +350,7 @@ class QwenSpace2Act_VLM(baseframework):
         latent_cfg = self.config.framework.latent_reasoning
         return {
             "base_vlm": str(self.config.framework.qwenvl.base_vlm),
-            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_future_plan")),
+            "token_order": str(latent_cfg.get("token_order", "spatial_instruction_plan_future")),
             "channels": {
                 channel: int(latent_cfg.channels[channel].token_count)
                 for channel in SPACE2ACT_CHANNELS
