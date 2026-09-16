@@ -188,7 +188,15 @@ class EpisodeTeacherStore:
             if "suite" in metadata:
                 suite = metadata["suite"]
                 dataset_name = self.dataset_path.name
-                if dataset_name != suite and not dataset_name.startswith(f"{suite}_"):
+                # RoboTwin suites are namespaced as
+                # ``robotwin_<domain>_<task>`` while each LeRobot dataset is
+                # stored in the task-local directory.  Accept that suffix
+                # form in addition to the historical LIBERO suite names.
+                if (
+                    dataset_name != suite
+                    and not dataset_name.startswith(f"{suite}_")
+                    and not suite.endswith(f"_{dataset_name}")
+                ):
                     raise ValueError(
                         f"Teacher metadata suite={suite!r} does not match dataset {dataset_name}"
                     )

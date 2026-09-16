@@ -162,6 +162,10 @@ seed_policy: "explicit_per_anchor"
 
 原有 `complete`、episode、suite、layer、stride、block、step、branch、shape 和 checkpoint metadata 继续保留。文件缺少 confidence 或 metadata 不得被标记为 confidence-aware cache；loader 应明确报错，而不是静默退化。
 
+### 4.2.1 受限存储下的特征投影
+
+当原始 teacher hidden 维度造成不可接受的磁盘占用时，可在抽取侧使用 token-wise PCA。该投影对每个 token 位置共享同一个 `D -> K` 线性变换，不改变 token 数、anchor 顺序或 confidence/disagreement 的定义。RoboTwin 主配置将 LingBot `5120` 维和 Wan `3072` 维压到 `1024` 维；cache 必须记录 `feature_transform=tokenwise_pca_v1`、`source_feature_dim`、`feature_dim` 和 `projection_sha256`。PCA 应先在有限 calibration 子集上拟合，转换后删除临时原始 cache，再在全量抽取时在线应用同一 projection，避免同时保留两套全量特征。
+
 ### 4.3 旧缓存兼容
 
 旧的仅含 `features`/`anchor_frames` 的缓存仍可在 `confidence_aware_alignment.enabled=false` 时使用。开启 confidence-aware alignment 时必须拒绝旧缓存，避免用户误以为已经启用了可靠性调控。若需要对照实验，使用显式的 legacy 模式并在日志中记录 `confidence_aware=false`。
@@ -169,6 +173,31 @@ seed_policy: "explicit_per_anchor"
 ### 4.4 Packed cache
 
 后续执行 `pack_teacher_latents.py` 时，packed manifest 应增加 confidence 的 dtype、offset 和 shape 信息；`confidence.bin` 与 `features.bin` 分开存储，避免改变现有 features 的 mmap 布局。packed loader 必须同时校验 episode 的 confidence count、offset 和 anchor count。
+
+### 4.5 Teacher-native geometry audit
+
+在改动任何 alignment objective 前，先运行只读的全缓存审计：
+
+```bash
+python tools/analyze_space2act_teacher_geometry.py \
+  --data-root /data/jibaixu/Datasets/LIBERO/libero_no_noop \
+  --output-dir /data/jibaixu/analysis/space2act_teacher_geometry \
+  --workers 4 \
+  --progress log \
+  --progress-interval 30 \
+  --moto-checkpoint /data/jibaixu/Models/Moto/latent_motion_tokenizer_libero_delta4/saved_epoch_10_step_4690
+```
+
+该命令会先验证全部 finalized `samples4_confv1` cache，再读取特征，并写出
+`teacher_geometry_report.json` 与扁平 CSV。报告分别覆盖 S 的网格局部性、F 的
+时空结构、P 的 segment/query 结构和 VQ codebook 一致性，并给出 confidence
+分箱、校准重建误差及候选 confidence 权重的有效样本量。只验证缓存契约而不读取
+特征时，加入 `--dry-run`。
+
+审计会先打印已发现的 episode/anchor 总数，随后持续输出完成数、每个 teacher/suite 的
+完成数、吞吐率与 ETA；因此在 Slurm 中可直接 `tail -f` 作业日志。`--progress auto` 是
+默认值：交互式终端使用 Rich 进度条，非交互日志自动改用稳定文本行。调试时可显式使用
+`--progress rich`，不需要进度输出时使用 `--progress off`。
 
 ## 5. 训练期 loss 调控
 
