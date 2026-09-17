@@ -1,10 +1,13 @@
+# CUDA 12.8 wheels are required for NVIDIA Blackwell (sm_120) GPUs.
+--extra-index-url https://download.pytorch.org/whl/cu128
 transformers==4.57.0
 accelerate==1.5.2
 tiktoken
 einops
 transformers_stream_generator==0.0.4
 scipy
-torchvision==0.21.0
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
 setuptools==80.9.0
 pillow
 tensorboard
@@ -34,8 +37,7 @@ pyzmq  # GR00T-protocol policy server (deployment/model_server/server_policy_gr0
 tdigest==0.5.2.2
 
 # env for qwen3.5 tip: flash-linear-attention may break older checkpoints (performance regression on previous ckpts)
-# torch==2.6.0+cu124
-# triton==3.2.0
+# triton==3.4.0
 # flash-attn==2.7.4.post1
 # flash-linear-attention==0.3.2
 # causal_conv1d==1.5.0.post8
