@@ -157,9 +157,11 @@ def debug_on():
 import argparse
 import json
 import os
+import shutil
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 # Third-Party Libraries
 import numpy as np
@@ -199,6 +201,33 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize logger
 logger = get_logger(__name__)
+
+
+@dataclass
+class TrainingProgress:
+    """Small non-tensor state required to resume the training loop exactly."""
+
+    completed_steps: int = 0
+    vla_batches_consumed: int = 0
+    vla_epoch_count: int = 0
+    vla_batches_in_epoch: int = 0
+    adaptive_state: dict[str, Any] = field(default_factory=dict)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "completed_steps": self.completed_steps,
+            "vla_batches_consumed": self.vla_batches_consumed,
+            "vla_epoch_count": self.vla_epoch_count,
+            "vla_batches_in_epoch": self.vla_batches_in_epoch,
+            "adaptive_state": self.adaptive_state,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.completed_steps = int(state_dict["completed_steps"])
+        self.vla_batches_consumed = int(state_dict["vla_batches_consumed"])
+        self.vla_epoch_count = int(state_dict["vla_epoch_count"])
+        self.vla_batches_in_epoch = int(state_dict["vla_batches_in_epoch"])
+        self.adaptive_state = dict(state_dict.get("adaptive_state", {}))
 
 
 def load_fast_tokenizer():
@@ -267,6 +296,12 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self.vla_batches_consumed = 0
+        self.vla_epoch_count = 0
+        self.vla_batches_in_epoch = 0
+        self.training_progress = TrainingProgress()
+        self._pending_resume_state: str | None = None
+        self._data_iterators_initialized = False
         self._adaptive_loss_accumulator = {}
         self.total_batch_size = self._calculate_total_batch_size()
 
@@ -281,7 +316,6 @@ class VLATrainer(TrainerUtils):
         self._save_initial_configs()
 
         self._init_checkpointing()
-        self._adjust_lr_scheduler_for_resume()
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -291,12 +325,20 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
             self.accelerator,
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
+            self.lr_scheduler,
         )
+        self.accelerator.register_for_checkpointing(self.training_progress)
+        # Build the replay iterator before load_state restores the checkpoint RNG.
+        # DataLoader worker creation advances the parent RNG; restoring it afterward
+        # keeps the next model step bitwise aligned with uninterrupted training.
+        if self._pending_resume_state:
+            self._create_data_iterators()
+        self._restore_training_state()
 
         self._init_wandb()
 
@@ -358,27 +400,39 @@ class VLATrainer(TrainerUtils):
             logger.info(f"📊 Accessed config snapshot saved at {output_dir / 'config.yaml'}")
 
     def _init_checkpointing(self):
-        """Initialize checkpoint directory and handle checkpoint loading."""
+        """Resolve a full-state resume before distributed components are prepared."""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.training_state_pointer = os.path.join(self.checkpoint_dir, "latest_training_state")
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
-            resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
-            if resume_from_checkpoint:
-                self.resume_from_checkpoint = resume_from_checkpoint
-                self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
-                self._load_adaptive_state(self.resume_from_checkpoint)
+            resume_state, resume_manifest = self._get_latest_training_state()
+            if resume_state:
+                self._pending_resume_state = resume_state
+                self.completed_steps = resume_manifest["completed_steps"]
+                self.vla_batches_consumed = resume_manifest["vla_batches_consumed"]
+                self.vla_epoch_count = resume_manifest["vla_epoch_count"]
+                self.vla_batches_in_epoch = resume_manifest["vla_batches_in_epoch"]
                 logger.info(
-                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
+                    "Found complete training state at %s (step %s); it will be restored after Accelerate/DeepSpeed setup.",
+                    resume_state,
+                    self.completed_steps,
                 )
                 return
 
-            logger.warning(f"No valid checkpoint found in {self.checkpoint_dir}. Starting training from scratch.")
+            logger.warning(
+                "Resume was requested but no complete training state was found at %s. Starting a new training run.",
+                self.training_state_pointer,
+            )
             self.completed_steps = 0
+            # A requested full resume must never silently downgrade to a warm-start
+            # model load when the state directory is absent or incomplete.
+            self.resume_from_checkpoint = None
+            return
 
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
@@ -390,43 +444,76 @@ class VLATrainer(TrainerUtils):
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
 
-    def _adaptive_state_path(self, checkpoint_path: str) -> str:
-        """Return the optional runtime-state sidecar next to a model checkpoint."""
-        for suffix in ("_pytorch_model.pt", "_model.safetensors"):
-            if checkpoint_path.endswith(suffix):
-                return checkpoint_path[: -len(suffix)] + "_adaptive.json"
-        return os.path.splitext(checkpoint_path)[0] + "_adaptive.json"
+    def _get_latest_training_state(self) -> tuple[str | None, dict[str, int] | None]:
+        """Return the latest completed full-state checkpoint, if its manifest is valid."""
+        state_dir = Path(self.training_state_pointer)
+        manifest_path = state_dir / "resume_manifest.json"
+        if not state_dir.is_dir() or not manifest_path.is_file():
+            return None, None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            if manifest.get("format_version") != 1:
+                raise ValueError(f"unsupported format_version={manifest.get('format_version')!r}")
+            progress = {
+                key: int(manifest[key])
+                for key in (
+                    "completed_steps",
+                    "vla_batches_consumed",
+                    "vla_epoch_count",
+                    "vla_batches_in_epoch",
+                )
+            }
+            if any(value < 0 for value in progress.values()):
+                raise ValueError("training progress values must be non-negative")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
+            logger.warning("Ignoring invalid training-state manifest %s: %s", manifest_path, exc)
+            return None, None
+        return str(state_dir), progress
 
-    def _load_adaptive_state(self, checkpoint_path: str | None) -> None:
-        """Restore non-parameter adaptive weighting state when present."""
-        if not checkpoint_path or not hasattr(self.model, "set_adaptive_state"):
+    def _restore_training_state(self) -> None:
+        """Restore DeepSpeed, optimizer, scheduler, RNG, and loop progress after prepare()."""
+        if not self._pending_resume_state:
             return
-        state_path = self._adaptive_state_path(checkpoint_path)
-        if not os.path.isfile(state_path):
-            logger.info("No adaptive weighting sidecar found; starting its state fresh")
-            return
-        with open(state_path, "r", encoding="utf-8") as handle:
-            state = json.load(handle)
-        self.model.set_adaptive_state(state)
-        logger.info(f"Restored adaptive weighting state from {state_path}")
 
-    def _adjust_lr_scheduler_for_resume(self):
-        """Adjust LR scheduler state after resuming from non-zero steps."""
-        if self.completed_steps > 0:
-            logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
-            for _ in range(self.completed_steps):
-                self.lr_scheduler.step()
-            logger.info(
-                f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
+        expected_progress = (
+            self.completed_steps,
+            self.vla_batches_consumed,
+            self.vla_epoch_count,
+            self.vla_batches_in_epoch,
+        )
+        self.accelerator.load_state(self._pending_resume_state)
+        self.completed_steps = self.training_progress.completed_steps
+        self.vla_batches_consumed = self.training_progress.vla_batches_consumed
+        self.vla_epoch_count = self.training_progress.vla_epoch_count
+        self.vla_batches_in_epoch = self.training_progress.vla_batches_in_epoch
+        restored_progress = (
+            self.completed_steps,
+            self.vla_batches_consumed,
+            self.vla_epoch_count,
+            self.vla_batches_in_epoch,
+        )
+        if restored_progress != expected_progress:
+            raise RuntimeError(
+                "Training-state manifest does not match the saved progress object: "
+                f"manifest={expected_progress}, state={restored_progress}"
             )
 
-    def _load_checkpoint(self, checkpoint_path):
-        """Load checkpoint."""
-        self.accelerator.load_state(checkpoint_path)
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+        adaptive_model = self.accelerator.unwrap_model(self.model)
+        if self.training_progress.adaptive_state and hasattr(adaptive_model, "set_adaptive_state"):
+            adaptive_model.set_adaptive_state(self.training_progress.adaptive_state)
+
+        logger.info(
+            "Resumed complete training state from %s at step %s (VLA batches consumed: %s).",
+            self._pending_resume_state,
+            self.completed_steps,
+            self.vla_batches_consumed,
+        )
 
     def _save_checkpoint(self):
-        """Save current training state."""
+        """Save a complete restart state and the existing portable model export."""
+        self._save_training_state()
+
         # ZeRO-3 gathers parameters collectively, so every rank must enter
         # get_state_dict before rank 0 writes the resulting full checkpoint.
         state_dict = self.accelerator.get_state_dict(self.model)
@@ -461,6 +548,63 @@ class VLATrainer(TrainerUtils):
 
         self.accelerator.wait_for_everyone()
 
+    def _save_training_state(self) -> None:
+        """Atomically publish one completed Accelerate/DeepSpeed restart point."""
+        step = self.completed_steps
+        state_root = Path(self.checkpoint_dir)
+        final_dir = state_root / f"training_state_step_{step}"
+        staging_dir = state_root / f".training_state_step_{step}.incomplete"
+        pointer_path = Path(self.training_state_pointer)
+
+        adaptive_model = self.accelerator.unwrap_model(self.model)
+        adaptive_state = adaptive_model.get_adaptive_state() if hasattr(adaptive_model, "get_adaptive_state") else {}
+        self.training_progress.completed_steps = step
+        self.training_progress.vla_batches_consumed = self.vla_batches_consumed
+        self.training_progress.vla_epoch_count = self.vla_epoch_count
+        self.training_progress.vla_batches_in_epoch = self.vla_batches_in_epoch
+        self.training_progress.adaptive_state = adaptive_state
+
+        # Staging directories were never published through the pointer, so they can
+        # only be remnants of interrupted saves and may be discarded safely.
+        if self.accelerator.is_main_process:
+            for stale_dir in state_root.glob(".training_state_step_*.incomplete"):
+                if stale_dir.is_dir():
+                    shutil.rmtree(stale_dir)
+        self.accelerator.wait_for_everyone()
+
+        self.accelerator.save_state(str(staging_dir))
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            manifest = {
+                "format_version": 1,
+                "completed_steps": step,
+                "vla_batches_consumed": self.vla_batches_consumed,
+                "vla_epoch_count": self.vla_epoch_count,
+                "vla_batches_in_epoch": self.vla_batches_in_epoch,
+            }
+            with open(staging_dir / "resume_manifest.json", "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+            os.replace(staging_dir, final_dir)
+
+            # Replacing a symlink is atomic. Keep the old target until after the
+            # pointer moves so an interrupted save always leaves one valid state.
+            pointer_tmp = state_root / ".latest_training_state.next"
+            if pointer_tmp.exists() or pointer_tmp.is_symlink():
+                pointer_tmp.unlink()
+            os.symlink(final_dir.name, pointer_tmp)
+            os.replace(pointer_tmp, pointer_path)
+
+            for candidate in state_root.glob("training_state_step_*"):
+                if candidate != final_dir and candidate.is_dir():
+                    shutil.rmtree(candidate)
+            logger.info("Complete training state saved at %s", pointer_path)
+
+        self.accelerator.wait_for_everyone()
+
     def _log_metrics(self, metrics):
         """Record training metrics."""
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -480,20 +624,47 @@ class VLATrainer(TrainerUtils):
 
     def _create_data_iterators(self):
         """Create data iterators."""
+        self._set_vla_epoch(self.vla_epoch_count)
         self.vla_iter = iter(self.vla_train_dataloader)
+        batches_in_epoch = len(self.vla_train_dataloader)
+        if batches_in_epoch <= 0:
+            raise RuntimeError("Cannot resume from an empty VLA dataloader")
+        batches_to_skip = self.vla_batches_in_epoch
+        if not 0 <= batches_to_skip <= batches_in_epoch:
+            raise RuntimeError(
+                f"Saved VLA data cursor {batches_to_skip} is invalid for dataloader length {batches_in_epoch}"
+            )
+        for _ in range(batches_to_skip):
+            try:
+                next(self.vla_iter)
+            except StopIteration as exc:
+                raise RuntimeError("Saved VLA data cursor exceeds the dataloader length") from exc
+        self._data_iterators_initialized = True
+
+    def _set_vla_epoch(self, epoch: int) -> None:
+        """Match the sampler epoch used when the current iterator was first created."""
+        set_epoch = getattr(self.vla_train_dataloader, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+            return
+        sampler = getattr(self.vla_train_dataloader, "sampler", None)
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
 
     def _get_next_batch(self):
         """Get next batch (automatically handle data loop)."""
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
-            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
-                self.vla_train_dataloader, self.vla_epoch_count
-            )
+            self.vla_epoch_count += 1
+            self.vla_batches_in_epoch = 0
+            self._set_vla_epoch(self.vla_epoch_count)
+            self.vla_iter = iter(self.vla_train_dataloader)
             batch_vla = next(self.vla_iter)
 
+        self.vla_batches_consumed += 1
+        self.vla_batches_in_epoch += 1
         return batch_vla
 
     def _perf_rank_timing(self, data_time: float, model_time: float) -> dict[str, float]:
@@ -523,7 +694,8 @@ class VLATrainer(TrainerUtils):
     def train(self):
         """Execute training loop."""
         self._log_training_config()
-        self._create_data_iterators()
+        if not self._data_iterators_initialized:
+            self._create_data_iterators()
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
             initial=self.completed_steps,
