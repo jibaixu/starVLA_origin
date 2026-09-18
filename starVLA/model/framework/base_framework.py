@@ -8,6 +8,7 @@ Note: No device placement or optimizer concerns handled here (delegated to train
 
 import importlib
 import pkgutil
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 from omegaconf import OmegaConf
@@ -285,7 +286,18 @@ class baseframework(PreTrainedModel):
 
             model_state_dict = load_file(str(pretrained_checkpoint))
         else:
-            model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
+            # mmap avoids eagerly copying the complete checkpoint into every
+            # process during concurrent evaluation startup.  Keep a fallback
+            # for older torch/checkpoint combinations that do not support it.
+            try:
+                model_state_dict = torch.load(
+                    pretrained_checkpoint,
+                    map_location="cpu",
+                    weights_only=True,
+                    mmap=True,
+                )
+            except (TypeError, RuntimeError, ValueError, pickle.UnpicklingError):
+                model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
         # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
         model_keys = set(FrameworkModel.state_dict().keys())
         checkpoint_keys = set(model_state_dict.keys())
@@ -302,6 +314,10 @@ class baseframework(PreTrainedModel):
                 logger.warning(f"Unexpected keys in state_dict: {unexpected_keys}")
 
             raise e
+        finally:
+            # The model owns its parameters after load_state_dict; retaining
+            # the CPU state dict needlessly doubles the process RSS.
+            del model_state_dict
 
         # **ensure model is on GPU**
         FrameworkModel = FrameworkModel

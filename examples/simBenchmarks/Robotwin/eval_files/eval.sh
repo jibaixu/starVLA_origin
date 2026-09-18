@@ -49,6 +49,7 @@ gpu_id="${5:-0}"
 policy_ckpt_path="$6"
 policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
 policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
+sim_gpu_id="${ROBOTWIN_SIM_GPU:-${gpu_id}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
@@ -82,8 +83,8 @@ sed \
     -e "s/^port:.*/port: ${policy_port}/" \
     "${deploy_policy_template}" > "${runtime_deploy_policy}"
 
-export CUDA_VISIBLE_DEVICES="${gpu_id}"
-echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
+export CUDA_VISIBLE_DEVICES="${sim_gpu_id}"
+echo -e "\033[33mpolicy gpu: ${gpu_id}; RoboTwin simulation gpu: ${sim_gpu_id}\033[0m"
 
 EVAL_FILES_PATH="${SCRIPT_DIR}"
 STARVLA_PATH="${REPO_ROOT}"
@@ -102,6 +103,13 @@ echo "policy_port: ${policy_port}"
 
 echo "robotwin_python: ${robotwin_python}"
 echo "robotwin_eval: launching unbuffered eval_policy.py"
+extra_overrides=()
+if [[ -n "${ROBOTWIN_EVAL_VIDEO_LOG:-}" ]]; then
+    extra_overrides+=(--eval_video_log "${ROBOTWIN_EVAL_VIDEO_LOG}")
+fi
+if [[ -n "${ROBOTWIN_CLEAR_CACHE_FREQ:-}" ]]; then
+    extra_overrides+=(--clear_cache_freq "${ROBOTWIN_CLEAR_CACHE_FREQ}")
+fi
 PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning \
 "${robotwin_python}" -u script/eval_policy.py --config "${runtime_deploy_policy}" \
     --policy_ckpt_path "${policy_ckpt_path}" \
@@ -110,4 +118,5 @@ PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning \
     --task_config "${task_config}" \
     --ckpt_setting "${ckpt_setting}" \
     --seed "${seed}" \
-    --policy_name "${policy_name}"
+    --policy_name "${policy_name}" \
+    "${extra_overrides[@]}"
