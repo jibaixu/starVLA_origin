@@ -155,6 +155,7 @@ def debug_on():
 
 # Standard Library
 import argparse
+import gc
 import json
 import os
 import shutil
@@ -404,6 +405,7 @@ class VLATrainer(TrainerUtils):
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.training_state_pointer = os.path.join(self.checkpoint_dir, "latest_training_state")
+        self._cleanup_stale_training_states()
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
@@ -443,6 +445,18 @@ class VLATrainer(TrainerUtils):
         else:
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
+
+    def _cleanup_stale_training_states(self) -> None:
+        """Remove incomplete state writes left by a killed checkpoint process."""
+        if not self.accelerator.is_main_process:
+            self.accelerator.wait_for_everyone()
+            return
+        state_root = Path(self.checkpoint_dir)
+        for stale_dir in state_root.glob(".training_state_step_*.incomplete"):
+            if stale_dir.is_dir():
+                logger.warning("Removing incomplete training state: %s", stale_dir)
+                shutil.rmtree(stale_dir)
+        self.accelerator.wait_for_everyone()
 
     def _get_latest_training_state(self) -> tuple[str | None, dict[str, int] | None]:
         """Return the latest completed full-state checkpoint, if its manifest is valid."""
@@ -512,41 +526,56 @@ class VLATrainer(TrainerUtils):
 
     def _save_checkpoint(self):
         """Save a complete restart state and the existing portable model export."""
-        self._save_training_state()
+        self._pause_data_iterators()
+        try:
+            # The full ZeRO-3 state is the authoritative resume artifact. If this
+            # fails, do not attempt the much larger portable model gather.
+            self._save_training_state()
 
-        # ZeRO-3 gathers parameters collectively, so every rank must enter
-        # get_state_dict before rank 0 writes the resulting full checkpoint.
-        state_dict = self.accelerator.get_state_dict(self.model)
-        if self.accelerator.is_main_process:
-            save_format = getattr(self.config.trainer, "save_format", "pt")
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+            # ZeRO-3 gathers parameters collectively, so every rank must enter
+            # get_state_dict before rank 0 writes the resulting full checkpoint.
+            try:
+                state_dict = self.accelerator.get_state_dict(self.model)
+                if self.accelerator.is_main_process:
+                    save_format = getattr(self.config.trainer, "save_format", "pt")
+                    checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
-            if save_format == "safetensors":
-                from safetensors.torch import save_file
+                    if save_format == "safetensors":
+                        from safetensors.torch import save_file
 
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
-            elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-            else:
-                raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+                        save_file(state_dict, checkpoint_path + "_model.safetensors")
+                    elif save_format == "pt":
+                        torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                    else:
+                        raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
 
-            adaptive_model = self.accelerator.unwrap_model(self.model)
-            if hasattr(adaptive_model, "get_adaptive_state"):
-                with open(checkpoint_path + "_adaptive.json", "w", encoding="utf-8") as handle:
-                    json.dump(adaptive_model.get_adaptive_state(), handle, indent=2, sort_keys=True)
+                    adaptive_model = self.accelerator.unwrap_model(self.model)
+                    if hasattr(adaptive_model, "get_adaptive_state"):
+                        with open(checkpoint_path + "_adaptive.json", "w", encoding="utf-8") as handle:
+                            json.dump(adaptive_model.get_adaptive_state(), handle, indent=2, sort_keys=True)
 
-            summary_data = {"steps": self.completed_steps}
-            with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
-                f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+                    summary_data = {"steps": self.completed_steps}
+                    with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
+                        f.write(json.dumps(summary_data) + "\n")
+                    self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
 
-            if isinstance(self.config, AccessTrackedConfig):
-                logger.info("📊 Saving accessed configuration...")
-                output_dir = Path(self.config.output_dir)
-                self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
-                logger.info("✅ Configuration files saved")
-
-        self.accelerator.wait_for_everyone()
+                    if isinstance(self.config, AccessTrackedConfig):
+                        logger.info("📊 Saving accessed configuration...")
+                        output_dir = Path(self.config.output_dir)
+                        self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
+                        logger.info("✅ Configuration files saved")
+            except Exception as exc:
+                # The full training state is already safely published. A portable
+                # model export is useful for evaluation, but not required to resume.
+                logger.warning(
+                    "Portable model export at step %s failed; full training state remains usable: %s",
+                    self.completed_steps,
+                    exc,
+                )
+            finally:
+                self.accelerator.wait_for_everyone()
+        finally:
+            self._resume_data_iterators()
 
     def _save_training_state(self) -> None:
         """Atomically publish one completed Accelerate/DeepSpeed restart point."""
@@ -572,7 +601,12 @@ class VLATrainer(TrainerUtils):
                     shutil.rmtree(stale_dir)
         self.accelerator.wait_for_everyone()
 
-        self.accelerator.save_state(str(staging_dir))
+        try:
+            self.accelerator.save_state(str(staging_dir))
+        except Exception:
+            if self.accelerator.is_main_process and staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            raise
         self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_main_process:
@@ -604,6 +638,23 @@ class VLATrainer(TrainerUtils):
             logger.info("Complete training state saved at %s", pointer_path)
 
         self.accelerator.wait_for_everyone()
+
+    def _pause_data_iterators(self) -> None:
+        """Stop workers before checkpoint serialization to reduce host-memory peak."""
+        iterator = getattr(self, "vla_iter", None)
+        if iterator is None:
+            return
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        self.vla_iter = None
+        self._data_iterators_initialized = False
+        gc.collect()
+
+    def _resume_data_iterators(self) -> None:
+        """Recreate the iterator at the saved cursor after checkpointing."""
+        if self.vla_iter is None:
+            self._create_data_iterators()
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
