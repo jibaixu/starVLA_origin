@@ -155,14 +155,12 @@ def debug_on():
 
 # Standard Library
 import argparse
-import gc
 import json
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Tuple
 
 # Third-Party Libraries
 import numpy as np
@@ -202,33 +200,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize logger
 logger = get_logger(__name__)
-
-
-@dataclass
-class TrainingProgress:
-    """Small non-tensor state required to resume the training loop exactly."""
-
-    completed_steps: int = 0
-    vla_batches_consumed: int = 0
-    vla_epoch_count: int = 0
-    vla_batches_in_epoch: int = 0
-    adaptive_state: dict[str, Any] = field(default_factory=dict)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "completed_steps": self.completed_steps,
-            "vla_batches_consumed": self.vla_batches_consumed,
-            "vla_epoch_count": self.vla_epoch_count,
-            "vla_batches_in_epoch": self.vla_batches_in_epoch,
-            "adaptive_state": self.adaptive_state,
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.completed_steps = int(state_dict["completed_steps"])
-        self.vla_batches_consumed = int(state_dict["vla_batches_consumed"])
-        self.vla_epoch_count = int(state_dict["vla_epoch_count"])
-        self.vla_batches_in_epoch = int(state_dict["vla_batches_in_epoch"])
-        self.adaptive_state = dict(state_dict.get("adaptive_state", {}))
 
 
 def load_fast_tokenizer():
@@ -300,8 +271,7 @@ class VLATrainer(TrainerUtils):
         self.vla_batches_consumed = 0
         self.vla_epoch_count = 0
         self.vla_batches_in_epoch = 0
-        self.training_progress = TrainingProgress()
-        self._pending_resume_state: str | None = None
+        self._pending_model_resume: str | None = None
         self._data_iterators_initialized = False
         self._adaptive_loss_accumulator = {}
         self.total_batch_size = self._calculate_total_batch_size()
@@ -333,13 +303,10 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
             self.lr_scheduler,
         )
-        self.accelerator.register_for_checkpointing(self.training_progress)
-        # Build the replay iterator before load_state restores the checkpoint RNG.
-        # DataLoader worker creation advances the parent RNG; restoring it afterward
-        # keeps the next model step bitwise aligned with uninterrupted training.
-        if self._pending_resume_state:
-            self._create_data_iterators()
-        self._restore_training_state()
+        if self._pending_model_resume:
+            self._load_fast_resume_weights(self._pending_model_resume)
+            self._load_adaptive_state(self._pending_model_resume)
+        self._adjust_lr_scheduler_for_resume()
 
         self._init_wandb()
 
@@ -401,10 +368,10 @@ class VLATrainer(TrainerUtils):
             logger.info(f"📊 Accessed config snapshot saved at {output_dir / 'config.yaml'}")
 
     def _init_checkpointing(self):
-        """Resolve a full-state resume before distributed components are prepared."""
+        """Resolve a lightweight model-weight resume before distributed setup."""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        self.training_state_pointer = os.path.join(self.checkpoint_dir, "latest_training_state")
+        self.resume_progress_path = os.path.join(self.checkpoint_dir, "latest_resume.json")
         self._cleanup_stale_training_states()
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
@@ -412,27 +379,26 @@ class VLATrainer(TrainerUtils):
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
-            resume_state, resume_manifest = self._get_latest_training_state()
-            if resume_state:
-                self._pending_resume_state = resume_state
-                self.completed_steps = resume_manifest["completed_steps"]
-                self.vla_batches_consumed = resume_manifest["vla_batches_consumed"]
-                self.vla_epoch_count = resume_manifest["vla_epoch_count"]
-                self.vla_batches_in_epoch = resume_manifest["vla_batches_in_epoch"]
+            resume_checkpoint, resume_step = self._get_latest_model_checkpoint()
+            if resume_checkpoint:
+                self.resume_from_checkpoint = resume_checkpoint
+                self._pending_model_resume = resume_checkpoint
+                self.completed_steps = resume_step
+                self._load_light_resume_progress()
                 logger.info(
-                    "Found complete training state at %s (step %s); it will be restored after Accelerate/DeepSpeed setup.",
-                    resume_state,
+                    "Fast resume loaded model weights from %s at step %s; optimizer state will be reinitialized.",
+                    resume_checkpoint,
                     self.completed_steps,
                 )
                 return
 
             logger.warning(
-                "Resume was requested but no complete training state was found at %s. Starting a new training run.",
-                self.training_state_pointer,
+                "Resume was requested but no portable model checkpoint was found at %s. Starting a new training run.",
+                self.checkpoint_dir,
             )
             self.completed_steps = 0
-            # A requested full resume must never silently downgrade to a warm-start
-            # model load when the state directory is absent or incomplete.
+            # A requested light resume must not silently load an unrelated
+            # pretrained checkpoint when no portable checkpoint is available.
             self.resume_from_checkpoint = None
             return
 
@@ -447,214 +413,212 @@ class VLATrainer(TrainerUtils):
             self.completed_steps = 0
 
     def _cleanup_stale_training_states(self) -> None:
-        """Remove incomplete state writes left by a killed checkpoint process."""
+        """Remove obsolete full-state checkpoint trees from the old resume implementation."""
         if not self.accelerator.is_main_process:
             self.accelerator.wait_for_everyone()
             return
         state_root = Path(self.checkpoint_dir)
-        for stale_dir in state_root.glob(".training_state_step_*.incomplete"):
+        for temporary_path in state_root.glob("steps_*_model.*.tmp"):
+            try:
+                temporary_path.unlink()
+            except OSError as exc:
+                logger.warning("Could not remove stale checkpoint temporary file %s: %s", temporary_path, exc)
+        for stale_dir in list(state_root.glob(".training_state_step_*.incomplete")) + list(
+            state_root.glob("training_state_step_*")
+        ):
             if stale_dir.is_dir():
-                logger.warning("Removing incomplete training state: %s", stale_dir)
+                logger.warning("Removing obsolete full training state: %s", stale_dir)
                 shutil.rmtree(stale_dir)
         self.accelerator.wait_for_everyone()
 
-    def _get_latest_training_state(self) -> tuple[str | None, dict[str, int] | None]:
-        """Return the latest completed full-state checkpoint, if its manifest is valid."""
-        state_dir = Path(self.training_state_pointer)
-        manifest_path = state_dir / "resume_manifest.json"
-        if not state_dir.is_dir() or not manifest_path.is_file():
-            return None, None
+    def _get_latest_model_checkpoint(self) -> tuple[str | None, int]:
+        candidates = []
+        checkpoint_root = Path(self.checkpoint_dir)
+        for path in list(checkpoint_root.glob("steps_*_pytorch_model.pt")) + list(
+            checkpoint_root.glob("steps_*_model.safetensors")
+        ):
+            try:
+                step = int(path.name.split("_", 2)[1])
+            except (IndexError, ValueError):
+                continue
+            if path.is_file():
+                candidates.append((step, path))
+        if not candidates:
+            return None, 0
+        step, path = max(candidates, key=lambda item: item[0])
+        return str(path), step
+
+    def _load_fast_resume_weights(self, checkpoint_path: str) -> None:
+        """Load a full model export into a ZeRO-3 model without gathering it in RAM/GPU."""
+        rank = self.accelerator.process_index
+        checkpoint = {}
+        if rank == 0:
+            if checkpoint_path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                checkpoint = load_file(checkpoint_path, device="cpu")
+            else:
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+                except (TypeError, RuntimeError, ValueError):
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint_names = [*checkpoint] if rank == 0 else None
+        if dist.is_available() and dist.is_initialized():
+            names = [checkpoint_names]
+            dist.broadcast_object_list(names, src=0)
+            checkpoint_names = names[0]
+        checkpoint_names = set(checkpoint_names or ())
+
+        model = self.accelerator.unwrap_model(self.model)
         try:
-            with open(manifest_path, "r", encoding="utf-8") as handle:
-                manifest = json.load(handle)
-            if manifest.get("format_version") != 1:
-                raise ValueError(f"unsupported format_version={manifest.get('format_version')!r}")
-            progress = {
-                key: int(manifest[key])
-                for key in (
-                    "completed_steps",
-                    "vla_batches_consumed",
-                    "vla_epoch_count",
-                    "vla_batches_in_epoch",
+            import deepspeed
+
+            for name, parameter in model.named_parameters():
+                if name not in checkpoint_names:
+                    continue
+                with deepspeed.zero.GatheredParameters([parameter], modifier_rank=0):
+                    if rank == 0:
+                        parameter.data.copy_(checkpoint[name].to(device=parameter.device, dtype=parameter.dtype))
+            for name, buffer in model.named_buffers():
+                has_buffer = torch.tensor(
+                    int(rank == 0 and name in checkpoint and buffer.shape == checkpoint[name].shape),
+                    device=buffer.device,
+                    dtype=torch.int32,
                 )
-            }
-            if any(value < 0 for value in progress.values()):
-                raise ValueError("training progress values must be non-negative")
-        except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
-            logger.warning("Ignoring invalid training-state manifest %s: %s", manifest_path, exc)
-            return None, None
-        return str(state_dir), progress
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast(has_buffer, src=0)
+                if has_buffer.item():
+                    if rank == 0:
+                        buffer.data.copy_(checkpoint[name].to(device=buffer.device, dtype=buffer.dtype))
+                    if dist.is_available() and dist.is_initialized():
+                        dist.broadcast(buffer, src=0)
+        finally:
+            del checkpoint
+        self.accelerator.wait_for_everyone()
+        logger.info("Fast resume model weights loaded from %s", checkpoint_path)
 
-    def _restore_training_state(self) -> None:
-        """Restore DeepSpeed, optimizer, scheduler, RNG, and loop progress after prepare()."""
-        if not self._pending_resume_state:
+    def _adaptive_state_path(self, checkpoint_path: str) -> str:
+        """Return the optional adaptive-weight sidecar next to a model export."""
+        for suffix in ("_pytorch_model.pt", "_model.safetensors"):
+            if checkpoint_path.endswith(suffix):
+                return checkpoint_path[: -len(suffix)] + "_adaptive.json"
+        return os.path.splitext(checkpoint_path)[0] + "_adaptive.json"
+
+    def _load_adaptive_state(self, checkpoint_path: str | None) -> None:
+        """Restore non-parameter adaptive weighting state when present."""
+        if not checkpoint_path:
             return
-
-        expected_progress = (
-            self.completed_steps,
-            self.vla_batches_consumed,
-            self.vla_epoch_count,
-            self.vla_batches_in_epoch,
-        )
-        self.accelerator.load_state(self._pending_resume_state)
-        self.completed_steps = self.training_progress.completed_steps
-        self.vla_batches_consumed = self.training_progress.vla_batches_consumed
-        self.vla_epoch_count = self.training_progress.vla_epoch_count
-        self.vla_batches_in_epoch = self.training_progress.vla_batches_in_epoch
-        restored_progress = (
-            self.completed_steps,
-            self.vla_batches_consumed,
-            self.vla_epoch_count,
-            self.vla_batches_in_epoch,
-        )
-        if restored_progress != expected_progress:
-            raise RuntimeError(
-                "Training-state manifest does not match the saved progress object: "
-                f"manifest={expected_progress}, state={restored_progress}"
-            )
-
         adaptive_model = self.accelerator.unwrap_model(self.model)
-        if self.training_progress.adaptive_state and hasattr(adaptive_model, "set_adaptive_state"):
-            adaptive_model.set_adaptive_state(self.training_progress.adaptive_state)
+        if not hasattr(adaptive_model, "set_adaptive_state"):
+            return
+        state_path = self._adaptive_state_path(checkpoint_path)
+        if not os.path.isfile(state_path):
+            logger.info("No adaptive weighting sidecar found at %s; starting its state fresh", state_path)
+            return
+        try:
+            with open(state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            adaptive_model.set_adaptive_state(state)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Failed to restore adaptive weighting state from {state_path}: {exc}") from exc
+        logger.info("Restored adaptive weighting state from %s", state_path)
 
-        logger.info(
-            "Resumed complete training state from %s at step %s (VLA batches consumed: %s).",
-            self._pending_resume_state,
-            self.completed_steps,
-            self.vla_batches_consumed,
-        )
+    def _load_light_resume_progress(self) -> None:
+        # Light resume never replays a saved data cursor, including when the
+        # sidecar is stale, missing, or malformed.
+        self.vla_batches_consumed = 0
+        self.vla_epoch_count = 0
+        self.vla_batches_in_epoch = 0
+        if not os.path.isfile(self.resume_progress_path):
+            logger.info("No light resume progress file found; resuming from checkpoint step only")
+            return
+        try:
+            with open(self.resume_progress_path, "r", encoding="utf-8") as handle:
+                progress = json.load(handle)
+            if not isinstance(progress, dict):
+                raise ValueError("light resume progress must be a JSON object")
+            if int(progress.get("completed_steps", self.completed_steps)) != self.completed_steps:
+                logger.warning("Ignoring stale light resume progress file")
+                return
+            # Replaying the saved cursor can take hours and provides no exact
+            # continuation because optimizer/RNG state is not restored either.
+            logger.info("Light resume will start the data iterator from a new epoch")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid light resume progress: %s", exc)
+
+    def _adjust_lr_scheduler_for_resume(self) -> None:
+        if self.completed_steps <= 0:
+            return
+        logger.info("Advancing fresh LR scheduler to resume step %s", self.completed_steps)
+        for _ in range(self.completed_steps):
+            self.lr_scheduler.step()
 
     def _save_checkpoint(self):
-        """Save a complete restart state and the existing portable model export."""
-        self._pause_data_iterators()
+        """Save the portable model and a small progress sidecar."""
         try:
-            # The full ZeRO-3 state is the authoritative resume artifact. If this
-            # fails, do not attempt the much larger portable model gather.
-            self._save_training_state()
+            state_dict = self.accelerator.get_state_dict(self.model)
+            if self.accelerator.is_main_process:
+                save_format = getattr(self.config.trainer, "save_format", "pt")
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+                if save_format == "safetensors":
+                    from safetensors.torch import save_file
+                    model_path = checkpoint_path + "_model.safetensors"
+                    temporary_path = model_path + ".tmp"
+                    save_file(state_dict, temporary_path)
+                    os.replace(temporary_path, model_path)
+                elif save_format == "pt":
+                    model_path = checkpoint_path + "_pytorch_model.pt"
+                    temporary_path = model_path + ".tmp"
+                    torch.save(state_dict, temporary_path)
+                    os.replace(temporary_path, model_path)
+                else:
+                    raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
 
-            # ZeRO-3 gathers parameters collectively, so every rank must enter
-            # get_state_dict before rank 0 writes the resulting full checkpoint.
-            try:
-                state_dict = self.accelerator.get_state_dict(self.model)
-                if self.accelerator.is_main_process:
-                    save_format = getattr(self.config.trainer, "save_format", "pt")
-                    checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-
-                    if save_format == "safetensors":
-                        from safetensors.torch import save_file
-
-                        save_file(state_dict, checkpoint_path + "_model.safetensors")
-                    elif save_format == "pt":
-                        torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-                    else:
-                        raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
-
-                    adaptive_model = self.accelerator.unwrap_model(self.model)
-                    if hasattr(adaptive_model, "get_adaptive_state"):
-                        with open(checkpoint_path + "_adaptive.json", "w", encoding="utf-8") as handle:
-                            json.dump(adaptive_model.get_adaptive_state(), handle, indent=2, sort_keys=True)
-
-                    summary_data = {"steps": self.completed_steps}
-                    with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
-                        f.write(json.dumps(summary_data) + "\n")
-                    self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-
-                    if isinstance(self.config, AccessTrackedConfig):
-                        logger.info("📊 Saving accessed configuration...")
-                        output_dir = Path(self.config.output_dir)
-                        self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
-                        logger.info("✅ Configuration files saved")
-            except Exception as exc:
-                # The full training state is already safely published. A portable
-                # model export is useful for evaluation, but not required to resume.
-                logger.warning(
-                    "Portable model export at step %s failed; full training state remains usable: %s",
-                    self.completed_steps,
-                    exc,
-                )
-            finally:
-                self.accelerator.wait_for_everyone()
+                adaptive_model = self.accelerator.unwrap_model(self.model)
+                if hasattr(adaptive_model, "get_adaptive_state"):
+                    with open(checkpoint_path + "_adaptive.json", "w", encoding="utf-8") as handle:
+                        json.dump(adaptive_model.get_adaptive_state(), handle, indent=2, sort_keys=True)
+                with open(self.resume_progress_path + ".tmp", "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "format_version": 3,
+                            "completed_steps": self.completed_steps,
+                            "data_cursor_policy": "reset_epoch",
+                        },
+                        handle,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                os.replace(self.resume_progress_path + ".tmp", self.resume_progress_path)
+                # self._remove_older_model_checkpoints(checkpoint_path) # 删除旧的权重，暂时不删除，磁盘空间充裕
+                with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
+                    f.write(json.dumps({"steps": self.completed_steps}) + "\n")
+                self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+                if isinstance(self.config, AccessTrackedConfig):
+                    self.config.save_accessed_config(Path(self.config.output_dir) / "config.yaml", use_original_values=False)
+        except Exception as exc:
+            logger.warning("Checkpoint export at step %s failed; training will continue: %s", self.completed_steps, exc)
         finally:
-            self._resume_data_iterators()
+            self.accelerator.wait_for_everyone()
 
-    def _save_training_state(self) -> None:
-        """Atomically publish one completed Accelerate/DeepSpeed restart point."""
-        step = self.completed_steps
-        state_root = Path(self.checkpoint_dir)
-        final_dir = state_root / f"training_state_step_{step}"
-        staging_dir = state_root / f".training_state_step_{step}.incomplete"
-        pointer_path = Path(self.training_state_pointer)
-
-        adaptive_model = self.accelerator.unwrap_model(self.model)
-        adaptive_state = adaptive_model.get_adaptive_state() if hasattr(adaptive_model, "get_adaptive_state") else {}
-        self.training_progress.completed_steps = step
-        self.training_progress.vla_batches_consumed = self.vla_batches_consumed
-        self.training_progress.vla_epoch_count = self.vla_epoch_count
-        self.training_progress.vla_batches_in_epoch = self.vla_batches_in_epoch
-        self.training_progress.adaptive_state = adaptive_state
-
-        # Staging directories were never published through the pointer, so they can
-        # only be remnants of interrupted saves and may be discarded safely.
-        if self.accelerator.is_main_process:
-            for stale_dir in state_root.glob(".training_state_step_*.incomplete"):
-                if stale_dir.is_dir():
-                    shutil.rmtree(stale_dir)
-        self.accelerator.wait_for_everyone()
-
-        try:
-            self.accelerator.save_state(str(staging_dir))
-        except Exception:
-            if self.accelerator.is_main_process and staging_dir.exists():
-                shutil.rmtree(staging_dir)
-            raise
-        self.accelerator.wait_for_everyone()
-
-        if self.accelerator.is_main_process:
-            manifest = {
-                "format_version": 1,
-                "completed_steps": step,
-                "vla_batches_consumed": self.vla_batches_consumed,
-                "vla_epoch_count": self.vla_epoch_count,
-                "vla_batches_in_epoch": self.vla_batches_in_epoch,
-            }
-            with open(staging_dir / "resume_manifest.json", "w", encoding="utf-8") as handle:
-                json.dump(manifest, handle, indent=2, sort_keys=True)
-
-            if final_dir.exists():
-                shutil.rmtree(final_dir)
-            os.replace(staging_dir, final_dir)
-
-            # Replacing a symlink is atomic. Keep the old target until after the
-            # pointer moves so an interrupted save always leaves one valid state.
-            pointer_tmp = state_root / ".latest_training_state.next"
-            if pointer_tmp.exists() or pointer_tmp.is_symlink():
-                pointer_tmp.unlink()
-            os.symlink(final_dir.name, pointer_tmp)
-            os.replace(pointer_tmp, pointer_path)
-
-            for candidate in state_root.glob("training_state_step_*"):
-                if candidate != final_dir and candidate.is_dir():
-                    shutil.rmtree(candidate)
-            logger.info("Complete training state saved at %s", pointer_path)
-
-        self.accelerator.wait_for_everyone()
-
-    def _pause_data_iterators(self) -> None:
-        """Stop workers before checkpoint serialization to reduce host-memory peak."""
-        iterator = getattr(self, "vla_iter", None)
-        if iterator is None:
-            return
-        shutdown = getattr(iterator, "_shutdown_workers", None)
-        if callable(shutdown):
-            shutdown()
-        self.vla_iter = None
-        self._data_iterators_initialized = False
-        gc.collect()
-
-    def _resume_data_iterators(self) -> None:
-        """Recreate the iterator at the saved cursor after checkpointing."""
-        if self.vla_iter is None:
-            self._create_data_iterators()
+    def _remove_older_model_checkpoints(self, current_checkpoint_path: str) -> None:
+        """Keep only the newest portable model export to limit disk usage."""
+        current_prefix = os.path.basename(current_checkpoint_path) + "_"
+        checkpoint_root = Path(self.checkpoint_dir)
+        for path in checkpoint_root.glob("steps_*"):
+            if not path.is_file() or path.name.startswith(current_prefix):
+                continue
+            if not (
+                path.name.endswith("_pytorch_model.pt")
+                or path.name.endswith("_model.safetensors")
+                or path.name.endswith("_adaptive.json")
+            ):
+                continue
+            try:
+                path.unlink()
+                logger.info("Removed older model checkpoint: %s", path)
+            except OSError as exc:
+                logger.warning("Could not remove older model checkpoint %s: %s", path, exc)
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
@@ -674,22 +638,12 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
-        """Create data iterators."""
+        """Create a fresh data iterator without replaying a saved cursor."""
         self._set_vla_epoch(self.vla_epoch_count)
         self.vla_iter = iter(self.vla_train_dataloader)
         batches_in_epoch = len(self.vla_train_dataloader)
         if batches_in_epoch <= 0:
-            raise RuntimeError("Cannot resume from an empty VLA dataloader")
-        batches_to_skip = self.vla_batches_in_epoch
-        if not 0 <= batches_to_skip <= batches_in_epoch:
-            raise RuntimeError(
-                f"Saved VLA data cursor {batches_to_skip} is invalid for dataloader length {batches_in_epoch}"
-            )
-        for _ in range(batches_to_skip):
-            try:
-                next(self.vla_iter)
-            except StopIteration as exc:
-                raise RuntimeError("Saved VLA data cursor exceeds the dataloader length") from exc
+            raise RuntimeError("Cannot create an iterator from an empty VLA dataloader")
         self._data_iterators_initialized = True
 
     def _set_vla_epoch(self, epoch: int) -> None:
