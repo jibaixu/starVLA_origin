@@ -53,6 +53,10 @@ sim_gpu_id="${ROBOTWIN_SIM_GPU:-${gpu_id}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
+# Keep direct eval.sh invocations consistent with eval_robotwin.sh. The
+# RoboTwin base scene reads this before creating the renderer.
+export ROBOTWIN_RAY_TRACING_DENOISER="${ROBOTWIN_RAY_TRACING_DENOISER:-none}"
+
 # Keep direct eval.sh invocations independent from the caller's Conda
 # activation. RoboTwin's evaluator starts ffmpeg by command name.
 if [[ "${robotwin_python}" == */* ]]; then
@@ -100,6 +104,7 @@ echo "task_name: ${task_name}"
 echo "task_config: ${task_config}"
 echo "ckpt_setting: ${ckpt_setting}"
 echo "policy_port: ${policy_port}"
+echo "ray_tracing_denoiser: ${ROBOTWIN_RAY_TRACING_DENOISER}"
 
 echo "robotwin_python: ${robotwin_python}"
 echo "robotwin_eval: launching unbuffered eval_policy.py"
