@@ -624,6 +624,24 @@ class VLATrainer(TrainerUtils):
         """Record training metrics."""
         rank = dist.get_rank() if dist.is_initialized() else 0
         if self.completed_steps % self.config.trainer.logging_frequency == 0 and rank == 0:
+            if os.environ.get("STARVLA_MEMORY_LOG", "0").lower() in {"1", "true", "yes", "on"}:
+                try:
+                    with open("/proc/self/status", encoding="utf-8") as status_file:
+                        rss_kib = next(
+                            int(line.split()[1])
+                            for line in status_file
+                            if line.startswith("VmRSS:")
+                        )
+                    metrics["memory/rss_mib"] = round(rss_kib / 1024.0, 1)
+                    if torch.cuda.is_available():
+                        metrics["memory/cuda_allocated_mib"] = round(
+                            torch.cuda.memory_allocated() / 1024**2, 1
+                        )
+                        metrics["memory/cuda_reserved_mib"] = round(
+                            torch.cuda.memory_reserved() / 1024**2, 1
+                        )
+                except (OSError, StopIteration, ValueError):
+                    pass
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))

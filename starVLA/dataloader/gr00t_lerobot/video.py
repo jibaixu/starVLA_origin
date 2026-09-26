@@ -17,6 +17,10 @@
 import av
 import cv2
 import numpy as np
+from collections import OrderedDict
+import io
+import subprocess
+from PIL import Image
 
 import torch  # noqa: F401 # isort: skip
 import torchvision  # noqa: F401 # isort: skip
@@ -36,6 +40,28 @@ try:
 except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
+_PYAV_CONTAINER_CACHE: OrderedDict[str, object] = OrderedDict()
+_PYAV_CONTAINER_CACHE_SIZE = 4
+
+
+def _get_cached_pyav_container(video_path: str):
+    """Reuse a bounded number of PyAV containers to avoid native decoder leaks."""
+    container = _PYAV_CONTAINER_CACHE.pop(video_path, None)
+    if container is None:
+        container = av.open(video_path)
+    _PYAV_CONTAINER_CACHE[video_path] = container
+    while len(_PYAV_CONTAINER_CACHE) > _PYAV_CONTAINER_CACHE_SIZE:
+        _, stale = _PYAV_CONTAINER_CACHE.popitem(last=False)
+        stale.close()
+    return container
+
+
+def close_video_reader_cache() -> None:
+    """Close cached native video readers, useful at worker/process shutdown."""
+    while _PYAV_CONTAINER_CACHE:
+        _, container = _PYAV_CONTAINER_CACHE.popitem(last=False)
+        container.close()
+
 
 def get_frames_by_indices(
     video_path: str,
@@ -47,8 +73,11 @@ def get_frames_by_indices(
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
         vr = decord.VideoReader(video_path, **video_backend_kwargs)
-        frames = vr.get_batch(indices)
-        return frames.asnumpy()
+        try:
+            frames = vr.get_batch(indices)
+            return frames.asnumpy()
+        finally:
+            del vr
     elif video_backend == "torchcodec":
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")
@@ -72,7 +101,7 @@ def get_frames_by_indices(
         # Use PyAV directly without torchvision wrapper
         container = None
         try:
-            container = av.open(video_path)
+            container = _get_cached_pyav_container(video_path)
             stream = container.streams.video[0]
             time_base = float(stream.time_base)
             fps = float(stream.average_rate) if stream.average_rate else float(stream.guessed_rate)
@@ -142,14 +171,17 @@ def get_frames_by_timestamps(
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
         vr = decord.VideoReader(video_path, **video_backend_kwargs)
-        num_frames = len(vr)
-        # Retrieve the timestamps for each frame in the video
-        frame_ts: np.ndarray = vr.get_frame_timestamp(range(num_frames))
-        # Map each requested timestamp to the closest frame index
-        # Only take the first element of the frame_ts array which corresponds to start_seconds
-        indices = np.abs(frame_ts[:, :1] - timestamps).argmin(axis=0)
-        frames = vr.get_batch(indices)
-        return frames.asnumpy()
+        try:
+            num_frames = len(vr)
+            # Retrieve the timestamps for each frame in the video
+            frame_ts: np.ndarray = vr.get_frame_timestamp(range(num_frames))
+            # Map each requested timestamp to the closest frame index
+            # Only take the first element of the frame_ts array which corresponds to start_seconds
+            indices = np.abs(frame_ts[:, :1] - timestamps).argmin(axis=0)
+            frames = vr.get_batch(indices)
+            return frames.asnumpy()
+        finally:
+            del vr
     elif video_backend == "torchcodec":
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")
@@ -234,9 +266,9 @@ def get_frames_by_timestamps(
             return frames
             
         finally:
-            if container is not None:
-                container.close()
-                container = None
+            # Containers are bounded and reused; do not close them after each
+            # sample or the native decoder allocation grows over time.
+            container = None
     
     elif video_backend == "torchvision_av":
         torchvision.set_video_backend("pyav")
@@ -292,6 +324,20 @@ def get_frames_by_timestamps(
         
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)
+    elif video_backend == "ffmpeg":
+        # Decode each requested frame in a short-lived ffmpeg process. This is
+        # slower than an in-process decoder but bounds native RSS for AV1 data.
+        loaded_frames = []
+        for target_ts in timestamps:
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-ss", str(float(target_ts)), "-i", video_path,
+                "-frames:v", "1", "-f", "image2pipe",
+                "-vcodec", "png", "-",
+            ]
+            result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            loaded_frames.append(np.asarray(Image.open(io.BytesIO(result.stdout)).convert("RGB")))
+        return np.stack(loaded_frames)
     else:
         raise NotImplementedError
 

@@ -69,6 +69,40 @@ LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT_STATS_FORMAT_VERSION = 2
 EPSILON = 5e-4
 
+
+def _resize_observation_image(image: Image.Image, target_size: Sequence[int], mode: str) -> Image.Image:
+    """Resize an observation image while honoring the dataset's geometry policy.
+
+    ``stretch`` preserves the historical behavior. ``letterbox`` keeps the full
+    camera frame visible by fitting it inside the target canvas and padding the
+    unused area with a neutral gray background.
+    """
+    if len(target_size) != 2:
+        raise ValueError(f"sample_image_size must contain [height, width], got {target_size!r}")
+    target_height, target_width = (int(target_size[0]), int(target_size[1]))
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError(f"sample_image_size values must be positive, got {target_size!r}")
+
+    mode = str(mode).lower()
+    if mode == "stretch":
+        # Preserve the historical PIL resize behavior for all existing datasets.
+        return image.resize((target_width, target_height))
+    if mode != "letterbox":
+        raise ValueError(f"Unsupported sample_image_resize_mode={mode!r}; expected 'stretch' or 'letterbox'.")
+
+    source_width, source_height = image.size
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError(f"Observation image has invalid size {image.size!r}")
+    scale = min(target_width / source_width, target_height / source_height)
+    resized_width = max(1, round(source_width * scale))
+    resized_height = max(1, round(source_height * scale))
+    resized = image.resize((resized_width, resized_height), Image.BILINEAR)
+    canvas = Image.new("RGB", (target_width, target_height), color=(128, 128, 128))
+    left = (target_width - resized_width) // 2
+    top = (target_height - resized_height) // 2
+    canvas.paste(resized.convert("RGB"), (left, top))
+    return canvas
+
 #  LeRobot v3.0 dataset file names 
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
@@ -1418,9 +1452,15 @@ class LeRobotSingleDataset(Dataset):
     def _pack_sample(self, data: dict, trajectory_id: int | None = None, base_index: int | None = None) -> dict:
         """将变换后的模态数据打包，并按需附加当前 step 的教师特征。"""
         step_images = []
+        sample_image_size = self.data_cfg.get("sample_image_size", [224, 224]) if self.data_cfg else [224, 224]
+        sample_image_resize_mode = (
+            self.data_cfg.get("sample_image_resize_mode", "stretch") if self.data_cfg else "stretch"
+        )
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            image = _resize_observation_image(
+                Image.fromarray(image), sample_image_size, sample_image_resize_mode
+            )
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
@@ -1525,7 +1565,9 @@ class LeRobotSingleDataset(Dataset):
                     episode_chunk=chunk_index, episode_index=trajectory_id
                 )
                 assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
+                self.curr_traj_data = pd.read_parquet(parquet_path)
+                self.curr_traj_id = trajectory_id
+                return self.curr_traj_data
         elif self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
     
@@ -1548,6 +1590,8 @@ class LeRobotSingleDataset(Dataset):
             
             # filter by trajectory_id
             episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
+            self.curr_traj_data = episode_data
+            self.curr_traj_id = trajectory_id
             return episode_data
 
 

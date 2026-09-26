@@ -411,9 +411,13 @@ def read_mode_config(pretrained_checkpoint):
         assert checkpoint_pt.suffix in {".pt", ".safetensors"}
         run_dir = checkpoint_pt.parents[1]
 
-        # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
-        config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"
-        assert config_yaml.exists(), f"Missing `config.yaml` for `{run_dir = }`"
+        # Prefer the complete resolved configuration. `config.yaml` is an
+        # accessed-only snapshot and may omit fields read inside DataLoader
+        # worker processes (for example, datasets.vla_data.include_state).
+        config_full_yaml = run_dir / "config.full.yaml"
+        config_yaml = config_full_yaml if config_full_yaml.exists() else run_dir / "config.yaml"
+        dataset_statistics_json = run_dir / "dataset_statistics.json"
+        assert config_yaml.exists(), f"Missing `config.full.yaml` or `config.yaml` for `{run_dir = }`"
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
 
         # Otherwise =>> try looking for a match on `model_id_or_path` on the HF Hub (`model_id_or_path`)

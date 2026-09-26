@@ -354,6 +354,64 @@ class PolicyNormProcessor:
     def transform(self) -> ComposedModalityTransform:
         return self._transform
 
+    @property
+    def action_statistics(self) -> Dict[str, np.ndarray]:
+        """Return the checkpoint's flattened action statistics."""
+        stats = self._norm_stats[self._unnorm_key].get("action", {})
+        return {key: np.asarray(value) for key, value in stats.items()}
+
+    @property
+    def state_statistics(self) -> Dict[str, np.ndarray]:
+        """Return the checkpoint's flattened state statistics."""
+        stats = self._norm_stats[self._unnorm_key].get("state", {})
+        return {key: np.asarray(value) for key, value in stats.items()}
+
+    # ------------------------------------------------------------------
+    # Forward path (environment state -> normalized model state)
+    # ------------------------------------------------------------------
+    def apply_state(self, state: np.ndarray) -> np.ndarray:
+        """Apply the training-time state transform to a flat state array.
+
+        ``state`` may be ``(D,)`` or ``(T, D)``.  The returned array always
+        has shape ``(T, D)`` so it can be passed directly as one model
+        example's state history.
+        """
+        state = np.asarray(state, dtype=np.float32)
+        if state.ndim == 1:
+            state = state[np.newaxis, :]
+        if state.ndim != 2:
+            raise ValueError(f"Expected state shape (D,) or (T,D), got {state.shape}")
+
+        expected_dim = sum(self._state_key_dims.get(key, 1) for key in self._state_keys)
+        if state.shape[-1] != expected_dim:
+            raise ValueError(
+                f"State dim {state.shape[-1]} does not match checkpoint dim {expected_dim}; "
+                f"state_keys={self._state_keys}"
+            )
+        if not np.isfinite(state).all():
+            raise ValueError("State contains NaN or Inf")
+
+        data: Dict[str, np.ndarray] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims.get(full_key, 1)
+            data[full_key] = np.ascontiguousarray(state[:, cursor : cursor + dim_k])
+            cursor += dim_k
+
+        out = self._transform.apply(data)
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            value = out[full_key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            parts.append(np.asarray(value, dtype=np.float32))
+        normalized = np.concatenate(parts, axis=-1)
+        if normalized.shape != state.shape or not np.isfinite(normalized).all():
+            raise ValueError(
+                f"Normalized state is invalid: expected {state.shape}, got {normalized.shape}"
+            )
+        return normalized
+
     # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
