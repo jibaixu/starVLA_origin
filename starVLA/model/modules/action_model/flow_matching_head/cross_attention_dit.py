@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from typing import Optional
 
 import torch
@@ -209,18 +208,18 @@ class DiT(ModelMixin, ConfigMixin):
         compute_dtype=torch.float32,
         final_dropout: bool = True,
         positional_embeddings: Optional[str] = "sinusoidal",
+        # Single forward-mode switch: false is legacy all-cross attention;
+        # true is canonical alternating cross/self attention.
         interleave_self_attention=False,
-        use_canonical_forward: bool = True,  # False restores the legacy all-cross-attention forward (old checkpoints)
+        # Deprecated compatibility alias for older checkpoint configs.
+        use_canonical_forward: Optional[bool] = None,
         cross_attention_dim: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
-        if not use_canonical_forward:
-            logging.getLogger(__name__).warning(
-                "use_canonical_forward=False: running the legacy all-cross-attention DiT forward. "
-                "Old checkpoints may have degraded performance due to state-conditioning issues. "
-                "Please retrain with the updated forward path when possible."
-            )
+        if use_canonical_forward is not None:
+            interleave_self_attention = bool(use_canonical_forward)
+        self._interleave_self_attention = bool(interleave_self_attention)
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
@@ -237,7 +236,7 @@ class DiT(ModelMixin, ConfigMixin):
         all_blocks = []
         for idx in range(self.config.num_layers):
 
-            use_self_attn = idx % 2 == 1 and interleave_self_attention
+            use_self_attn = idx % 2 == 1 and self._interleave_self_attention
             curr_cross_attention_dim = cross_attention_dim if not use_self_attn else None
 
             all_blocks += [
@@ -294,7 +293,7 @@ class DiT(ModelMixin, ConfigMixin):
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
-            if idx % 2 == 1 and self.config.interleave_self_attention and self.config.use_canonical_forward:
+            if idx % 2 == 1 and self._interleave_self_attention:
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,

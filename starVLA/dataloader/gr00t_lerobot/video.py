@@ -336,7 +336,12 @@ def get_frames_by_timestamps(
                 "-vcodec", "png", "-",
             ]
             result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            loaded_frames.append(np.asarray(Image.open(io.BytesIO(result.stdout)).convert("RGB")))
+            # Copy the pixels before closing PIL/BytesIO so no decoder buffer or
+            # file-like object survives until the next sample.
+            with io.BytesIO(result.stdout) as image_buffer:
+                with Image.open(image_buffer) as image:
+                    loaded_frames.append(np.asarray(image.convert("RGB")).copy())
+            del result
         return np.stack(loaded_frames)
     else:
         raise NotImplementedError

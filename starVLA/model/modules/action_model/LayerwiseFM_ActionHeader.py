@@ -417,6 +417,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         suffix_length: int | None = None,
         prefix_attention_schedule: str = "exp",
         max_guidance_weight: float = 10.0,
+        encoder_attention_mask=None,
     ) -> torch.Tensor:
         """RTC-aware flow-matching inference.
 
@@ -438,12 +439,18 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             prefix_attention_schedule: ΠGDM only. Weight schedule for the
                 transition zone — "exp", "linear", "ones", or "zeros".
             max_guidance_weight: ΠGDM only. Cap on the guidance weight.
+            encoder_attention_mask: Optional mask for encoder/KV tokens in
+                every cross-attention block.
 
         Returns:
             actions: (B, action_horizon, action_dim) predicted actions.
         """
         if prev_action_chunk is None or inference_delay <= 0:
-            return self.predict_action(vl_embs_list, state)
+            return self.predict_action(
+                vl_embs_list,
+                state,
+                encoder_attention_mask=encoder_attention_mask,
+            )
 
         import math
 
@@ -485,6 +492,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs_list,
                 timestep=timesteps,
+                encoder_attention_mask=encoder_attention_mask,
                 return_pre_output=True,
             )
             pred = self.action_decoder(model_output)
@@ -611,6 +619,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embs_list,
                     timestep=temb_tensor,
+                    encoder_attention_mask=encoder_attention_mask,
                     return_pre_output=True,
                 )
 

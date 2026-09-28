@@ -65,6 +65,10 @@ class EmbodimentTag(Enum):
     """ The ARX5 single-arm robot.
     """
 
+    ARX_X5 = 'arx_x5'
+    """ The ARX X5 dual-arm robot used by RoboDojo.
+    """
+
     DOS_W1 = 'dos-w1'
     """ The DOS-W1 single-arm robot.
     """
@@ -81,6 +85,7 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.ALOHA.value: 7,
     EmbodimentTag.UR5.value: 8,
     EmbodimentTag.ARX5.value: 9,
+    EmbodimentTag.ARX_X5.value: 9,
     EmbodimentTag.DOS_W1.value: 10,
 }
 

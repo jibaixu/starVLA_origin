@@ -55,10 +55,7 @@ from starVLA.model.framework.share_tools import merge_framework_config, populate
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
-from starVLA.training.trainer_utils import initialize_overwatch
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-
-logger = initialize_overwatch(__name__)
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -126,7 +123,9 @@ class QwenPI_v3DefaultConfig:
                 "action_dit_hidden_dim": 1024,
                 "dropout": 0.2,
                 "final_dropout": True,
-                "interleave_self_attention": True,
+                # false preserves the legacy all-cross mode; true enables the
+                # canonical alternating cross/self-attention path.
+                "interleave_self_attention": False,
                 "norm_type": "ada_norm",
                 "positional_embeddings": None,
                 "attention_head_dim": 64,
@@ -148,6 +147,11 @@ class Qwen_PI_v3(baseframework):
       ``action_dit_hidden_dim`` before feeding the Action DiT.
     - Layer-wise cross-DiT flow-matching action head that attends to every
       selected VLM layer in parallel.
+
+    QwenPI_v3 defaults to the historical legacy all-cross-attention DiT
+    forward. Set ``interleave_self_attention=true`` for checkpoints trained
+    with alternating cross/self attention. ``use_canonical_forward`` remains
+    accepted as a compatibility alias by the underlying DiT.
 
     Focus: predict a future action chunk conditioned on multi-view images
     and a natural-language instruction (with optional discretised state prefix).
